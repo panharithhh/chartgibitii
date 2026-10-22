@@ -59,7 +59,7 @@ def harvest_khmer_corpus(cfg: Config) -> str:
             if total_chars >= cfg.max_corpus_chars or time.time() - t_harvest > cfg.max_harvest_hours * 3600:
                 print(f"  -> budget reached; skipping the remaining sources (from {src['name']})")
                 break
-            cap = src.get("cap") or float("inf")
+            cap = src.get("cap_chars") or float("inf")   # per-source share, so one crawl cannot eat the budget
             n_src, c_src, t0 = 0, 0, time.time()
             try:
                 label, ds = open_hf_stream(src["loads"], src.get("require"))
@@ -82,7 +82,7 @@ def harvest_khmer_corpus(cfg: Config) -> str:
                                 reservoir[j] = line
                         if n_src % 500_000 == 0:
                             print(f"     ... {n_src:,} lines, {c_src / 1e6:,.0f}M chars ({time.time() - t0:.0f}s)")
-                    if (n_src >= cap or total_chars + c_src >= cfg.max_corpus_chars
+                    if (c_src >= cap or total_chars + c_src >= cfg.max_corpus_chars
                             or time.time() - t0 > cfg.max_seconds_per_source):
                         break
             except Exception as e:   # gated / renamed / network error -> keep what we have

@@ -11,25 +11,26 @@ _BACTRIAN_KM = [dict(path="MBZUAI/Bactrian-X", hub_file="data/km.json.gz"),
                 dict(path="rinabuoy/Bactrian-X-km")]
 
 # Pretraining corpus. Order matters: curated sources first, large web crawls fill the budget.
+# cap_chars = max characters taken from one source (None = no per-source limit).
 HARVEST_SOURCES = [
     dict(name="Chuon Nath Dictionary 44k", loads=[dict(path="seanghay/khmer-dictionary-44k")],
-         fields=["word", "definition", "example"], sep=" ", cap=None),
-    dict(name="Bactrian-X Khmer 67k", loads=_BACTRIAN_KM, fields=["instruction", "input", "output"], cap=None),
+         fields=["word", "definition", "example"], sep=" "),
+    dict(name="Bactrian-X Khmer 67k", loads=_BACTRIAN_KM, fields=["instruction", "input", "output"]),
     dict(name="Alpaca Khmer 52k", loads=[dict(path="saillab/alpaca-khmer-cleaned")],
-         fields=["instruction", "input", "output"], cap=None),
+         fields=["instruction", "input", "output"]),
     dict(name="Khmer text pairs", loads=[dict(path="rinabuoy/text-pairs-khmer-part-2")],
-         fields=["text"], cap=200_000),
+         fields=["text"], cap_chars=100_000_000),
     dict(name="FineWeb-2 khm_Khmr", loads=[dict(path="HuggingFaceFW/fineweb-2", config="khm_Khmr")],
-         fields=["text"], cap=800_000),
+         fields=["text"], cap_chars=1_600_000_000),
     dict(name="khmer-lm-corpus 1.25M", loads=[dict(path="phonsobon/khmer-lm-corpus")],
-         fields=["text"], cap=1_000_000),
+         fields=["text"]),
     dict(name="khmer-pile", loads=[dict(path="sovannpanhaseng/khmer-pile"),
                                    dict(path="sovannpanhaseng/khmer-pile-raw")],
-         fields=["text"], cap=700_000),
+         fields=["text"], cap_chars=1_000_000_000),
     dict(name="khmer-text-corpus 4.9M", loads=[dict(path="Panhapich/khmer-text-corpus", config="raw"),
                                                dict(path="Panhapich/khmer-text-corpus", data_files="all_text.txt"),
                                                dict(path="Panhapich/khmer-text-corpus")],
-         fields=["text"], cap=None),
+         fields=["text"]),
 ]
 
 # Post-training (SFT).
