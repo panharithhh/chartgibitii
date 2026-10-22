@@ -268,7 +268,8 @@ def setup_runtime(allow_ddp: bool = True) -> Runtime:
     ddp = allow_ddp and int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank, local_rank, world = 0, 0, 1
     if ddp:
-        dist.init_process_group("nccl", timeout=timedelta(hours=4))
+        # long timeout: other ranks wait at a barrier while rank 0 downloads data / trains the tokenizer
+        dist.init_process_group("nccl", timeout=timedelta(hours=12))
         rank, world = dist.get_rank(), dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
