@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "khmer-llm"
+version = "0.2.0"
+description = "Khmer LLM from scratch: tokenizer -> pretrain -> SFT -> RAG with a Kimi-style MoE transformer trained with Muon"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1", "numpy", "sentencepiece>=0.1.99", "datasets>=2.14", "tqdm"]
+
+[project.optional-dependencies]
+rag = ["scipy", "transformers>=4.36"]
+ui = ["gradio>=4"]
+dev = ["pytest", "scipy", "transformers>=4.36"]
+
+[project.scripts]
+khmer-llm = "khmer_llm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["khmer_llm*"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "tests"]
+testpaths = ["tests"]

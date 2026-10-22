@@ -1,0 +1,9 @@
+torch>=2.1
+numpy
+sentencepiece>=0.1.99
+datasets>=2.14
+tqdm
+scipy
+transformers>=4.36
+# optional: customer web page
+# gradio>=4
