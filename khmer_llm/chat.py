@@ -7,8 +7,14 @@ from typing import Optional
 import torch
 
 from .runtime import Runtime, autocast_ctx
+from .text import clean_multiline
 
 SFT_SYSTEM_PROMPT = ""   # optional Khmer system prompt prepended to every example
+
+
+def neutralize_markers(text: str) -> str:
+    """Stops chat markers typed by users or found in documents from becoming real role tokens."""
+    return text.replace("<|", "< |")
 
 
 def build_chat_example(tok, instruction: str, response: Optional[str] = None, context: str = "",
@@ -17,10 +23,11 @@ def build_chat_example(tok, instruction: str, response: Optional[str] = None, co
     Returns (ids, loss_mask) with mask = 1 only on answer tokens + EOS, or None if it cannot fit.
     Over-long examples lose the end of the context first, then the end of the answer.
     """
-    head = (tok.marker("<|system|>") + tok.encode(system)) if system else []
-    ctx = (tok.marker("<|context|>") + tok.encode(context)) if context else []
-    tail = tok.marker("<|user|>") + tok.encode(instruction) + tok.marker("<|assistant|>")
-    resp = (tok.encode(response) + [tok.eos_id]) if response is not None else []
+    enc = lambda text: tok.encode(neutralize_markers(text))
+    head = (tok.marker("<|system|>") + enc(system)) if system else []
+    ctx = (tok.marker("<|context|>") + enc(context)) if context else []
+    tail = tok.marker("<|user|>") + enc(instruction) + tok.marker("<|assistant|>")
+    resp = (enc(response) + [tok.eos_id]) if response is not None else []
     if max_len is not None:
         over = len(head) + len(ctx) + len(tail) + len(resp) - max_len
         if over > 0 and ctx:
@@ -50,6 +57,7 @@ def generate(model, tok, prompt: str, rt: Runtime, max_new_tokens: int = 80,
 def chat(model, tok, question: str, rt: Runtime, context: str = "", max_new_tokens: int = 200,
          temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1) -> str:
     """Answers a Khmer question with the chat template (optionally grounded on `context`)."""
+    question, context = clean_multiline(question), clean_multiline(context)
     L = model.cfg.context_length
     budget = L - max_new_tokens - 1
     built = build_chat_example(tok, question, None, context, max_len=budget, system=SFT_SYSTEM_PROMPT)
@@ -58,7 +66,7 @@ def chat(model, tok, question: str, rt: Runtime, context: str = "", max_new_toke
     else:   # question alone is longer than the window: keep its end
         user, asst = tok.marker("<|user|>"), tok.marker("<|assistant|>")
         keep = budget - len(user) - len(asst)
-        prompt = [tok.eos_id] + user + tok.encode(question)[-keep:] + asst
+        prompt = [tok.eos_id] + user + tok.encode(neutralize_markers(question))[-keep:] + asst
     idx = torch.tensor([prompt], dtype=torch.long, device=rt.device)
     out = model.generate(idx, max_new_tokens, temperature, top_k, top_p, eos_id=tok.eos_id,
                          amp=autocast_ctx(rt), repetition_penalty=repetition_penalty)

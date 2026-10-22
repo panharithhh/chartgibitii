@@ -1,7 +1,9 @@
 """Stage 3 — RAG: Khmer question in -> retrieve passages -> chat model answers from them, with sources."""
 import json
 import os
+import re
 import time
+from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -9,12 +11,12 @@ import torch
 import torch.nn.functional as F
 
 from ..chat import build_chat_example, chat
-from ..config import Config
+from ..config import Config, with_architecture_of
 from ..data.tokenizer import KhmerTokenizer
 from ..model.lm import KimiMoELM, build_model
-from ..runtime import Runtime, ensure_package, setup_runtime
-from ..text import chunk_text
-from ..train.checkpoint import first_existing, load_model_weights
+from ..runtime import Runtime, ensure_package, link_previous_outputs, setup_runtime
+from ..text import chunk_text, clean_multiline, normalize_khmer
+from ..train.checkpoint import atomic_torch_save, first_existing
 
 RAG_DEMO_QUESTIONS = [
     "តើរាជធានីនៃប្រទេសកម្ពុជាគឺជាអ្វី?",            # What is the capital of Cambodia?
@@ -78,7 +80,7 @@ class BM25Index:
         from scipy import sparse
         rows, cols, vals, lengths = [], [], [], np.zeros(len(token_lists), dtype=np.float32)
         for d, ids in enumerate(token_lists):
-            if not ids:
+            if len(ids) == 0:
                 continue
             terms, tf = np.unique(np.asarray(ids, dtype=np.int64), return_counts=True)
             rows.append(np.full(len(terms), d, dtype=np.int64))
@@ -155,6 +157,26 @@ class DenseEncoder:
         return out
 
 
+NGRAM_BUCKETS = 1 << 20
+NON_WORD_RE = re.compile(r"[^\wក-៿᧠-᧿]+")   # \w alone misses Khmer vowel signs
+
+
+def char_trigrams(text: str) -> np.ndarray:
+    """Hashed character trigrams with spaces/punctuation removed: robust to how Khmer is spaced."""
+    s = NON_WORD_RE.sub("", normalize_khmer(text).lower())
+    cp = np.frombuffer(s.encode("utf-32-le"), dtype=np.uint32).astype(np.int64)
+    if len(cp) < 3:
+        return cp % NGRAM_BUCKETS
+    return ((cp[:-2] * 1000003 + cp[1:-1]) * 1000003 + cp[2:]) % NGRAM_BUCKETS
+
+
+def lexical_terms(tok: KhmerTokenizer, text: str, ids: Optional[List[int]] = None) -> np.ndarray:
+    """BM25 terms = canonical SentencePiece ids + (offset) hashed char trigrams."""
+    ids = tok.encode(text) if ids is None else ids
+    pieces = np.asarray(tok.retrieval_terms(ids), dtype=np.int64)
+    return np.concatenate([pieces, tok.vocab_size + char_trigrams(text)])
+
+
 def rrf_fuse(ranked_lists: List[List[int]], top_k: int, k: int = 60) -> List[int]:
     """Reciprocal Rank Fusion of several ranked id lists."""
     scores: Dict[int, float] = {}
@@ -173,8 +195,8 @@ def _rag_fingerprint(cfg: Config, tok: KhmerTokenizer) -> dict:
         mtime = os.path.getmtime(src) if os.path.exists(src) else 0
         size = os.path.getsize(src) if os.path.exists(src) else 0
     return dict(src=src, mtime=mtime, size=size, max_lines=cfg.rag_max_corpus_lines, chunk=cfg.rag_chunk_chars,
-                overlap=cfg.rag_chunk_overlap_chars, dense=cfg.rag_dense_model, tokenizer=tok.model_file,
-                vocab=tok.vocab_size)
+                overlap=cfg.rag_chunk_overlap_chars, dense=cfg.rag_dense_model, tokenizer=tok.fingerprint,
+                lexical="pieces+trigrams-v1")
 
 
 class KhmerRAG:
@@ -190,23 +212,24 @@ class KhmerRAG:
             self.dense = dense.to(rt.device) if rt.device_type == "cuda" else dense.float()
 
     @classmethod
-    def build(cls, cfg: Config, rt: Runtime, model: KimiMoELM, tok: KhmerTokenizer) -> "KhmerRAG":
+    def build(cls, cfg: Config, rt: Runtime, model: KimiMoELM, tok: KhmerTokenizer,
+              prefer_existing_index: bool = False) -> "KhmerRAG":
+        """Loads the cached index when it matches, else (re)builds it.
+        prefer_existing_index: with no rag_docs_dir given, reuse whatever index exists (ask / ui)."""
         fp = _rag_fingerprint(cfg, tok)
-        encoder = None
-        if cfg.rag_dense_model:
-            try:
-                encoder = DenseEncoder(cfg.rag_dense_model, rt.device)
-            except Exception as e:
-                print(f"[!] Dense retriever unavailable ({type(e).__name__}: {str(e)[:150]}); using BM25 only.")
-        if os.path.exists(cfg.rag_index_path):
-            saved = torch.load(cfg.rag_index_path, map_location="cpu", weights_only=False)
-            if saved.get("fingerprint") == fp:
-                print(f"[✓] RAG index loaded: {len(saved['chunks']):,} passages")
-                dense = saved.get("dense") if encoder is not None else None
-                if encoder is not None and dense is None:
-                    dense = encoder.encode(saved["chunks"], is_query=False)
-                return cls(cfg, rt, model, tok, saved["chunks"], saved["sources"],
-                           BM25Index.from_state(saved["bm25"]), encoder, dense)
+        saved = torch.load(cfg.rag_index_path, map_location="cpu", weights_only=False) \
+            if os.path.exists(cfg.rag_index_path) else None
+        saved_fp = (saved or {}).get("fingerprint") or {}
+        reuse = saved is not None and (saved_fp == fp or (prefer_existing_index and not cfg.rag_docs_dir
+                                                          and saved_fp.get("tokenizer") == tok.fingerprint))
+        encoder = _load_encoder(saved_fp.get("dense") if reuse else cfg.rag_dense_model, rt)
+        if reuse:
+            print(f"[✓] RAG index loaded: {len(saved['chunks']):,} passages from {saved_fp.get('src')}")
+            dense = saved.get("dense") if encoder is not None else None
+            if encoder is not None and dense is None:
+                dense = encoder.encode(saved["chunks"], is_query=False)
+            return cls(cfg, rt, model, tok, saved["chunks"], saved["sources"],
+                       BM25Index.from_state(saved["bm25"]), encoder, dense)
 
         print("\n[🔎] Building RAG index...")
         chunks, sources, seen = [], [], set()
@@ -218,61 +241,69 @@ class KhmerRAG:
                     sources.append(src)
         if not chunks:
             raise RuntimeError("RAG knowledge base is empty: put .txt/.md/.jsonl files in Config.rag_docs_dir.")
-        bm25 = BM25Index().build([tok.retrieval_terms(ids) for ids in tok.encode_batch(chunks)], tok.vocab_size)
+        terms = [lexical_terms(tok, c, ids) for c, ids in zip(chunks, tok.encode_batch(chunks))]
+        bm25 = BM25Index().build(terms, tok.vocab_size + NGRAM_BUCKETS)
         dense = None
         if encoder is not None:
             t0 = time.time()
             dense = encoder.encode(chunks, is_query=False)
             print(f"     dense embeddings: {tuple(dense.shape)} in {time.time() - t0:.0f}s")
-        torch.save(dict(fingerprint=fp, chunks=chunks, sources=sources, bm25=bm25.state(), dense=dense),
-                   cfg.rag_index_path)
+        atomic_torch_save(dict(fingerprint=fp, chunks=chunks, sources=sources, bm25=bm25.state(), dense=dense),
+                          cfg.rag_index_path)
         kind = "BM25" + (f" + dense ({cfg.rag_dense_model})" if dense is not None else "")
         print(f"[✓] RAG index: {len(chunks):,} passages | {kind} -> {cfg.rag_index_path}")
         return cls(cfg, rt, model, tok, chunks, sources, bm25, encoder, dense)
 
     @classmethod
     def load(cls, cfg: Optional[Config] = None) -> "KhmerRAG":
-        """Rebuilds the whole Q&A stack from files in work_dir (notebook / CLI / web UI)."""
+        """Rebuilds the whole Q&A stack from files in work_dir (notebook / CLI / web UI).
+        Model shape and vocab come from the saved weights, so CLI defaults never mismatch them."""
         cfg = cfg or Config()
+        link_previous_outputs(cfg)
         rt = setup_runtime(allow_ddp=False)
-        tok = KhmerTokenizer(cfg)
-        return cls.build(cfg, rt, load_chat_model(cfg, rt), tok)
+        model = load_chat_model(cfg, rt)
+        cfg = with_architecture_of(cfg, asdict(model.cfg))
+        return cls.build(cfg, rt, model, KhmerTokenizer(cfg), prefer_existing_index=True)
 
     def retrieve(self, question: str, top_k: Optional[int] = None) -> List[int]:
+        question = clean_multiline(question)
         k = top_k or self.cfg.rag_top_k
         n_cand = max(50, 10 * k)
-        ranked = [self.bm25.search(self.tok.retrieval_terms(self.tok.encode(question)), n_cand)]
+        ranked = [self.bm25.search(lexical_terms(self.tok, question), n_cand)]
         if self.encoder is not None and self.dense is not None:
             q = self.encoder.encode([question], is_query=True)[0].to(self.dense.device, self.dense.dtype)
             sims = self.dense @ q
             ranked.append(torch.topk(sims.float(), min(n_cand, len(sims))).indices.tolist())
         return rrf_fuse(ranked, k)
 
-    def build_context(self, question: str, hits: List[int], max_new_tokens: int) -> str:
-        """Numbered passages, cut to fit the model window together with the question and answer."""
+    def build_context(self, question: str, hits: List[int], max_new_tokens: int) -> Tuple[str, List[int]]:
+        """Numbered passages cut to fit the window with the question and answer; also returns the hits used."""
         q_len = len(build_chat_example(self.tok, question, None, "")[0])
         budget = min(self.cfg.rag_max_context_tokens, self.model.cfg.context_length - max_new_tokens - q_len - 8)
-        parts, used = [], 0
+        parts, used_hits, used = [], [], 0
         for n, i in enumerate(hits, 1):
             piece = f"[{n}] {self.chunks[i]}"
             ids = self.tok.encode(piece)
             if used + len(ids) > budget:
-                if not parts and budget > 16:
+                if not parts and budget > 16:   # first passage alone is too long: keep its beginning
                     parts.append(self.tok.decode(ids[:budget]))
+                    used_hits.append(i)
                 break
             parts.append(piece)
+            used_hits.append(i)
             used += len(ids) + 1
-        return "\n".join(parts)
+        return "\n".join(parts), used_hits
 
     def ask(self, question: str, top_k: Optional[int] = None, max_new_tokens: Optional[int] = None,
             temperature: float = 0.3, verbose: bool = True) -> dict:
+        question = clean_multiline(question)
         max_new = max_new_tokens or self.cfg.rag_max_new_tokens
         hits = self.retrieve(question, top_k)
-        context = self.build_context(question, hits, max_new)
+        context, used_hits = self.build_context(question, hits, max_new)
         answer = chat(self.model, self.tok, question, self.rt, context=context, max_new_tokens=max_new,
                       temperature=temperature, top_p=0.9)
         result = dict(question=question, answer=answer,
-                      sources=[dict(source=self.sources[i], passage=self.chunks[i]) for i in hits])
+                      sources=[dict(source=self.sources[i], passage=self.chunks[i]) for i in used_hits])
         if verbose:
             print(f"\n❓ {question}\n💬 {answer}")
             for n, s in enumerate(result["sources"], 1):
@@ -280,22 +311,35 @@ class KhmerRAG:
         return result
 
 
+def _load_encoder(name: Optional[str], rt: Runtime) -> Optional[DenseEncoder]:
+    if not name:
+        return None
+    try:
+        return DenseEncoder(name, rt.device)
+    except Exception as e:
+        print(f"[!] Dense retriever unavailable ({type(e).__name__}: {str(e)[:150]}); using BM25 only.")
+        return None
+
+
 def load_chat_model(cfg: Config, rt: Runtime) -> KimiMoELM:
+    """SFT weights if present (else the base model), built with the architecture saved alongside them."""
     path = first_existing([cfg.sft_final_path, cfg.sft_ckpt_path])
     if path is None:
         path = first_existing([cfg.pretrained_ckpt, cfg.final_path, cfg.ckpt_path])
         if path is None:
             raise FileNotFoundError("No model weights found: run the 'pretrain' (and 'sft') stages first.")
         print(f"[!] No SFT model found; RAG uses the base model {path} (answers will be weak).")
-    model = build_model(cfg, rt)
-    load_model_weights(model, path)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model = build_model(with_architecture_of(cfg, ckpt.get("config") or {}), rt)
+    model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     model.eval()
     print(f"[✓] Q&A model loaded from {path}")
     return model
 
 
 def run_rag(cfg: Config, rt: Runtime, tok: KhmerTokenizer) -> KhmerRAG:
-    rag = KhmerRAG.build(cfg, rt, load_chat_model(cfg, rt), tok)
+    model = load_chat_model(cfg, rt)
+    rag = KhmerRAG.build(with_architecture_of(cfg, asdict(model.cfg)), rt, model, tok)
     print("\n" + "=" * 78)
     print("💬 RAG DEMO — Khmer question in, grounded answer + sources out")
     print("=" * 78)

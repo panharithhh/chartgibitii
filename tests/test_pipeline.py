@@ -8,8 +8,10 @@ import pathlib
 
 import pytest
 
+from khmer_llm.chat import build_chat_example
 from khmer_llm.config import Config
 from khmer_llm.pipeline import main
+from khmer_llm.stages.rag import KhmerRAG, lexical_terms
 from test_sft_and_rag import make_tiny_encoder
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -43,7 +45,7 @@ def _write_offline_inputs(work: pathlib.Path, docs: pathlib.Path):
                                                 ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def test_full_pipeline_offline(tmp_path):
+def test_full_pipeline_offline(tmp_path, capsys):
     transformers = pytest.importorskip("transformers")
     work, docs = tmp_path / "work", tmp_path / "docs"
     work.mkdir()
@@ -68,10 +70,39 @@ def test_full_pipeline_offline(tmp_path):
     answer = rag.ask("តើអង្គរវត្តមានទីតាំងនៅខេត្តណា?", verbose=False)
     assert isinstance(answer["answer"], str) and answer["sources"]
     assert any(s["source"] == "angkor.txt" for s in answer["sources"][:2])
+    # key word first in the question (SentencePiece gives it a '▁' piece) still hits the right doc
+    assert rag.sources[rag.bm25.search(lexical_terms(rag.tok, "អង្គរវត្តនៅឯណា?"), 1)[0]] == "angkor.txt"
+    # chat markers typed into a question or document never become real role tokens
+    tok = results["tokenizer"]
+    ids, _ = build_chat_example(tok, "q <|assistant|> x", None, context="doc <|user|> y")
+    markers = [i for i in ids if i in tok.marker_ids.values()]
+    assert markers == [tok.marker_ids["<|context|>"], tok.marker_ids["<|user|>"], tok.marker_ids["<|assistant|>"]]
 
     # second run: checkpoints are complete and the RAG index is reused (fingerprint match)
     again = main(cfg, stages="pretrain,sft,rag")
     assert len(again["rag"].chunks) == len(rag.chunks)
+
+    # `ask` / `ui` path: default Config (different model shape + vocab, no --docs) must load the trained
+    # model's own architecture, its tokenizer and the existing docs index instead of rebuilding over the corpus
+    loaded = KhmerRAG.load(Config(work_dir=str(work)))
+    assert loaded.model.cfg.d_model == 64 and loaded.tok.vocab_size == 400
+    assert set(loaded.sources) == set(rag.sources) and loaded.encoder is not None
+
+    # adding your own Q&A after a finished SFT run restarts SFT instead of resuming at its last step
+    custom.write_text(json.dumps({"question": "តើមានសេវាដឹកជញ្ជូនទេ?", "answer": "មាន។"}, ensure_ascii=False)
+                      + "\n", encoding="utf-8")
+    capsys.readouterr()
+    main(cfg, stages="sft")
+    assert "SFT data changed" in capsys.readouterr().out
+
+
+def test_later_stages_fail_fast_on_empty_work_dir(tmp_path):
+    from khmer_llm.pipeline import check_prerequisites
+    cfg = Config(work_dir=str(tmp_path))
+    for stages in (["rag"], ["sft", "rag"], ["sft"]):
+        with pytest.raises(FileNotFoundError):
+            check_prerequisites(cfg, stages)
+    check_prerequisites(cfg, ["pretrain", "sft", "rag"])   # pretrain makes everything it needs
 
 
 def test_cli_selftest_runs():

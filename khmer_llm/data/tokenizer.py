@@ -1,5 +1,6 @@
 """SentencePiece Unigram tokenizer with byte fallback and atomic chat-marker tokens."""
 import os
+import zlib
 from typing import List, Optional
 
 import sentencepiece as spm
@@ -39,9 +40,19 @@ class KhmerTokenizer:
         missing = [s for s, i in self.marker_ids.items() if i == self.unk_id]
         if missing:   # tokenizer from an older run: markers still work, just as several pieces
             print(f"[!] Tokenizer has no atomic chat markers {missing}; they will be encoded as text.")
+        # identifies the trained model (not just its path), so caches built with another tokenizer are rebuilt
+        self.fingerprint = f"{zlib.crc32(self.sp.serialized_model_proto()):08x}"
         skip = {self.unk_id, self.bos_id, self.eos_id, self.pad_id, self.sp.piece_to_id("▁")}
         skip.update(i for i in self.marker_ids.values() if i != self.unk_id)
         self._retrieval_skip = skip
+        # "▁word" (word after a space / at text start) -> "word", so retrieval matches either position
+        self._canonical = list(range(self.vocab_size))
+        for i in range(self.vocab_size):
+            piece = self.sp.id_to_piece(i)
+            if piece.startswith("▁") and len(piece) > 1:
+                j = self.sp.piece_to_id(piece[1:])
+                if j != self.unk_id:
+                    self._canonical[i] = j
 
     def encode(self, text: str) -> List[int]:
         return self.sp.encode(text, out_type=int)
@@ -60,5 +71,5 @@ class KhmerTokenizer:
         return [i] if i != self.unk_id else self.encode(symbol)
 
     def retrieval_terms(self, ids: List[int]) -> List[int]:
-        """Token ids used as BM25 terms (drops control ids, chat markers and the bare '▁')."""
-        return [i for i in ids if i not in self._retrieval_skip]
+        """BM25 terms: ids without control ids / chat markers / bare '▁', with '▁word' folded to 'word'."""
+        return [self._canonical[i] for i in ids if i not in self._retrieval_skip]

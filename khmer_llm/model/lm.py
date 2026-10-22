@@ -71,16 +71,20 @@ class KimiMoELM(nn.Module):
     def generate(self, idx, max_new_tokens: int, temperature: float = 0.8, top_k: int = 50,
                  top_p: float = 0.95, eos_id: Optional[int] = None, amp=None,
                  repetition_penalty: float = 1.0):
-        """KV-cache sampling. When the window fills, re-prefill with the most recent half."""
+        """KV-cache sampling. When the window fills, re-prefill with the most recent half.
+        repetition_penalty applies only to generated tokens (never the prompt / retrieved context)
+        and never to eos_id, so it does not discourage copying from passages or stopping."""
         was_training = self.training
         self.eval()
         L = self.cfg.context_length
         idx = idx[:, -L:]
+        prompt_len = idx.size(1)
         with (amp if amp is not None else nullcontext()):
             logits, _, cache = self(idx, kv_cache=[None] * len(self.layers), last_only=True)
             for _ in range(max_new_tokens):
+                generated = idx[:, prompt_len:] if repetition_penalty != 1.0 and idx.size(1) > prompt_len else None
                 nxt = sample_next_token(logits[:, -1].float(), temperature, top_k, top_p,
-                                        idx if repetition_penalty != 1.0 else None, repetition_penalty)
+                                        generated, repetition_penalty, protect_id=eos_id)
                 idx = torch.cat([idx, nxt], dim=1)
                 if eos_id is not None and bool((nxt == eos_id).all()):
                     break
@@ -94,11 +98,15 @@ class KimiMoELM(nn.Module):
 
 
 def sample_next_token(logits, temperature: float, top_k: int, top_p: float,
-                      prev_ids: Optional[torch.Tensor] = None, repetition_penalty: float = 1.0) -> torch.Tensor:
-    if prev_ids is not None and repetition_penalty != 1.0:   # CTRL-style penalty on already-seen tokens
+                      prev_ids: Optional[torch.Tensor] = None, repetition_penalty: float = 1.0,
+                      protect_id: Optional[int] = None) -> torch.Tensor:
+    if prev_ids is not None and prev_ids.numel() and repetition_penalty != 1.0:   # CTRL-style penalty
+        original = logits
         seen = logits.gather(-1, prev_ids)
         seen = torch.where(seen > 0, seen / repetition_penalty, seen * repetition_penalty)
         logits = logits.scatter(-1, prev_ids, seen)
+        if protect_id is not None:
+            logits[:, protect_id] = original[:, protect_id]
     if temperature <= 0:
         return logits.argmax(dim=-1, keepdim=True)
     logits = logits / temperature

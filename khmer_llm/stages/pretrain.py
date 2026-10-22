@@ -1,4 +1,6 @@
 """Stage 1 — pretraining: next-token prediction on the harvested Khmer corpus."""
+import os
+
 import numpy as np
 
 from ..chat import generate
@@ -21,8 +23,9 @@ def run_pretrain(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
     T, B = cfg.context_length, cfg.batch_size
     train_loader = TokenLoader(cfg.train_bin, B, T, rt.device, cfg.seed + rt.rank)
     train_eval_loader = TokenLoader(cfg.train_bin, B, T, rt.device, cfg.seed + 10_000)
-    val_data = np.memmap(cfg.val_bin, dtype=np.uint16, mode="r")
-    if len(val_data) <= T + 1:   # tiny corpus -> fall back to the tail of train
+    if os.path.getsize(cfg.val_bin) // 2 > T + 1:
+        val_data = np.memmap(cfg.val_bin, dtype=np.uint16, mode="r")
+    else:   # tiny corpus (np.memmap cannot even open an empty file) -> tail of train
         val_data = np.memmap(cfg.train_bin, dtype=np.uint16, mode="r")[-(20 * T):]
     val_loader = TokenLoader(val_data, B, T, rt.device, cfg.seed + 20_000)
 
@@ -40,7 +43,9 @@ def run_pretrain(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
     step = run_training(cfg, rt, model, raw_model, train_loader,
                         {"train": train_eval_loader, "val": val_loader}, cfg.ckpt_path, sample_fn, "PRETRAIN")
 
-    if rt.master:
+    if rt.master and step == 0:
+        print("[!] No pretraining steps ran (time budget?); base model weights not written.")
+    elif rt.master:
         save_inference_weights(cfg.final_path, raw_model, cfg, tok.model_file, rt)
         print(f"[✓] Base model weights: {cfg.final_path} (step {step})")
         for p in PRETRAIN_SAMPLE_PROMPTS:

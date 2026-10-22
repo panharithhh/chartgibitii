@@ -26,6 +26,7 @@ from .train.loop import train_step
 class ToyTokenizer:
     """Character-level stand-in for KhmerTokenizer (tests only)."""
     eos_id, pad_id = 2, 3
+    fingerprint = "toy"
 
     def __init__(self, vocab: int):
         self.vocab = vocab

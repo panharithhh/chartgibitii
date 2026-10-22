@@ -14,6 +14,7 @@ from .selftest import self_test
 from .stages.pretrain import run_pretrain
 from .stages.rag import run_rag
 from .stages.sft import run_sft
+from .train.checkpoint import first_existing
 
 STAGES = ("pretrain", "sft", "rag")
 
@@ -26,6 +27,20 @@ def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
     tok = KhmerTokenizer(cfg)
     assert tok.vocab_size == cfg.vocab_size, f"tokenizer vocab {tok.vocab_size} != config {cfg.vocab_size}"
     return tok
+
+
+def check_prerequisites(cfg: Config, stage_list):
+    """Fail fast (before hours of downloading) when a later stage is run without earlier outputs."""
+    if "pretrain" in stage_list:
+        return
+    hint = "include the 'pretrain' stage, or point work_dir / import_dir at a previous run's outputs"
+    if not os.path.exists(cfg.tokenizer_prefix + ".model"):
+        raise FileNotFoundError(f"No tokenizer at {cfg.tokenizer_prefix}.model: {hint}.")
+    base = first_existing([cfg.pretrained_ckpt, cfg.ckpt_path, cfg.final_path])
+    if "sft" in stage_list and base is None:
+        raise FileNotFoundError(f"SFT needs pretrained weights in {cfg.work_dir}: {hint}.")
+    if "rag" in stage_list and base is None and first_existing([cfg.sft_final_path, cfg.sft_ckpt_path]) is None:
+        raise FileNotFoundError(f"RAG needs a trained model in {cfg.work_dir}: {hint}.")
 
 
 def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
@@ -54,6 +69,7 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     if rt.master:
         link_previous_outputs(cfg)
     barrier(rt)
+    check_prerequisites(cfg, stage_list)
     tok = prepare_tokenizer(cfg, rt)
     if rt.master and "pretrain" in stage_list:
         harvest_khmer_corpus(cfg)   # pretraining needs the corpus even when the tokenizer came from elsewhere

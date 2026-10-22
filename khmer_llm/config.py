@@ -1,7 +1,7 @@
 """All hyperparameters and file paths for every stage, in one dataclass."""
 import os
 import typing
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import List, Optional, Tuple
 
 
@@ -57,7 +57,7 @@ class Config:
 
     # ---- RAG ----
     rag_docs_dir: Optional[str] = None     # folder of .txt / .md / .jsonl docs; None -> slice of the corpus
-    rag_max_corpus_lines: int = 100_000    # used only when rag_docs_dir is None
+    rag_max_corpus_lines: int = 50_000     # used only when rag_docs_dir is None
     rag_chunk_chars: int = 500
     rag_chunk_overlap_chars: int = 100
     rag_top_k: int = 4
@@ -139,6 +139,16 @@ class Config:
     @property
     def rag_index_path(self) -> str:
         return self.path("khmer_rag_index.pt")
+
+
+ARCH_FIELDS = ("vocab_size", "context_length", "d_model", "n_layers", "n_heads", "n_kv_heads", "rope_theta",
+               "norm_eps", "n_dense_layers", "n_shared_experts", "n_routed_experts", "top_k", "d_ff_shared",
+               "d_ff_expert", "tie_embeddings")
+
+
+def with_architecture_of(cfg: Config, saved: dict) -> Config:
+    """cfg with model-shape fields taken from a saved config (so loading never mismatches shapes)."""
+    return replace(cfg, **{k: saved[k] for k in ARCH_FIELDS if k in saved})
 
 
 def _coerce(raw: str, typ):

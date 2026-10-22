@@ -50,9 +50,12 @@ def train_step(model, raw_model, muon, adam, scaler, loader, batch, step: int, c
     scaler.unscale_(muon)
     scaler.unscale_(adam)
     grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
-    scaler.step(muon)
-    scaler.step(adam)
-    scaler.update()
+    # An inf/nan anywhere makes the shared clip zero every grad, so skip BOTH optimizers together
+    # (GradScaler alone would still step the optimizer whose own grads looked finite).
+    if torch.isfinite(grad_norm):
+        scaler.step(muon)
+        scaler.step(adam)
+    scaler.update()   # lowers the fp16 loss scale when unscale_ found infs
     muon.zero_grad(set_to_none=True)
     adam.zero_grad(set_to_none=True)
     load = update_router_bias(raw_model.moe_layers(), cfg, rt)
@@ -73,6 +76,15 @@ def estimate_loss(raw_model, loaders: Dict[str, object], cfg: Config, rt: Runtim
         out[name] = total / cfg.eval_iters
     raw_model.train()
     return out
+
+
+def any_rank(flag: bool, rt: Runtime) -> bool:
+    """True if flag is True on any rank (keeps DDP ranks in lockstep on stop decisions)."""
+    if not rt.ddp:
+        return flag
+    t = torch.tensor(float(flag), device=rt.device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return t.item() > 0
 
 
 def load_summary(load: Optional[torch.Tensor]) -> str:
@@ -106,7 +118,7 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
         if rt.master:
             print(f"[✓] {title} already complete ({start_step}/{cfg.max_iters} steps).")
         return start_step
-    if not time_left(cfg):
+    if any_rank(not time_left(cfg), rt):
         if rt.master:
             print(f"[⏱] No time left for {title}; skipping.")
         return start_step
@@ -133,9 +145,7 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
 
         if step % cfg.log_interval == 0 or step == cfg.max_iters:
             dt = time.time() - t_log
-            stop = torch.tensor(float(not time_left(cfg)), device=rt.device)
-            if rt.ddp:
-                dist.all_reduce(stop, op=dist.ReduceOp.MAX)
+            stop = any_rank(not time_left(cfg), rt)
             if rt.master:
                 print(f"step {step:5d}/{cfg.max_iters} | loss {(loss_acc / n_acc).item():.4f} "
                       f"| lr {cfg.lr * mult:.2e} | gnorm {grad_norm.item():.2f} "
@@ -144,7 +154,7 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
                       f"{load_summary(load)}")
             loss_acc.zero_()
             n_acc, t_log = 0, time.time()
-            if stop.item() > 0:
+            if stop:
                 if rt.master:
                     print(f"[⏱] Time budget of {cfg.max_train_hours}h reached; stopping {title}.")
                 break

@@ -118,6 +118,8 @@ def link_previous_outputs(cfg: Config):
         return
     for name in sorted(os.listdir(cfg.import_dir)):
         src, dst = os.path.join(cfg.import_dir, name), cfg.path(name)
+        if name.endswith(".tmp"):   # half-written leftovers of a killed session
+            continue
         if os.path.isfile(src) and not os.path.lexists(dst):
             os.symlink(os.path.abspath(src), dst)
             print(f"[↪] linked {name} from {cfg.import_dir}")

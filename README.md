@@ -39,24 +39,27 @@ tests/                     pytest suite (runs offline on CPU)
 
 ### Kaggle (one cell)
 1. Notebook settings: **GPU on, Internet on**.
-2. Paste `kaggle/train_khmer_llm.py` into one cell and run it. It runs all three stages and saves
-   everything to `/kaggle/working`.
+2. Paste `kaggle/train_khmer_llm.py` into one cell. Put your settings in its **last line**, for example:
+   ```python
+   RESULTS = main(Config(rag_docs_dir="/kaggle/input/my-docs", launch_ui=True))
+   ```
+   Then run it. It runs all three stages and saves everything to `/kaggle/working`.
 3. Ask questions afterwards:
    ```python
    RESULTS["rag"].ask("តើរាជធានីនៃប្រទេសកម្ពុជាគឺជាអ្វី?")
    ```
-   For a public web page for customers, set `Config.launch_ui = True` before running.
+   `launch_ui=True` prints a public web link for customers.
 
 Kaggle stops after 12 hours, so long runs are split across sessions. Save the notebook version, add
-its output as an input, and set `Config.import_dir = "/kaggle/input/<that-output>"`. Every stage then
-resumes from its checkpoint.
+its output as an input, and run with `Config(import_dir="/kaggle/input/<that-output>")`. Every stage then
+resumes from its checkpoint. To skip stages that are already done, add `stages="sft,rag"`.
 
 ### Local / server
 ```bash
 pip install -e ".[rag,ui]"                          # needs torch already installed
 python -m khmer_llm run                             # all stages
 python -m khmer_llm run --stages sft,rag --docs examples/docs
-python -m khmer_llm ask "តើអង្គរវត្តនៅខេត្តណា?"     # one question
+python -m khmer_llm ask "តើអង្គរវត្តនៅខេត្តណា?"     # one question (reuses the docs index from the last run)
 python -m khmer_llm ask                             # interactive
 python -m khmer_llm ui                              # web page for customers
 python -m khmer_llm run --set max_iters=100 --set vocab_size=32000   # override any setting
@@ -68,7 +71,7 @@ To use 2 GPUs: `torchrun --nproc_per_node=2 -m khmer_llm run`.
 | What | How |
 |---|---|
 | Documents to answer from (RAG) | Put `.txt`, `.md` or `.jsonl` (`{"title", "text", "source"}`) files in a folder and pass `--docs <folder>`. See `examples/docs/`. |
-| Your own Q&A pairs (SFT) | One JSON object per line with `question` and `answer`, plus an optional `context`. Pass `--set sft_custom_jsonl=<file>`. These are upsampled 3×. See `examples/sft_custom.jsonl`. |
+| Your own Q&A pairs (SFT) | One JSON object per line with `question` and `answer`, plus an optional `context`. Pass `--set sft_custom_jsonl=<file>`. These are upsampled 3×. If you add or change them after a finished run, SFT restarts from the base model. See `examples/sft_custom.jsonl`. |
 
 With no docs folder, RAG falls back to a slice of the harvested Khmer corpus.
 

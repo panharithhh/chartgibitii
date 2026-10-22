@@ -68,8 +68,12 @@ def harvest_khmer_corpus(cfg: Config) -> str:
 def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
     meta_path = cfg.train_bin + ".json"
     if os.path.exists(cfg.train_bin) and os.path.exists(cfg.val_bin) and os.path.exists(meta_path):
-        print(f"[✓] Token bins found: {json.load(open(meta_path))}")
-        return
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get("tokenizer") in (None, tok.fingerprint):   # None: bins from before fingerprints existed
+            print(f"[✓] Token bins found: {meta}")
+            return
+        print("[!] Token bins were built with a different tokenizer; rebuilding.")
     assert tok.vocab_size < 2**16, "uint16 bins need vocab < 65536"
     print("\n[🔄] Tokenizing corpus -> uint16 memmap bins...")
     n_train = n_val = 0
@@ -101,8 +105,10 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
 
     os.replace(cfg.train_bin + ".tmp", cfg.train_bin)
     os.replace(cfg.val_bin + ".tmp", cfg.val_bin)
-    meta = dict(train_tokens=n_train, val_tokens=n_val, vocab_size=tok.vocab_size)
-    json.dump(meta, open(meta_path, "w"))
+    meta = dict(train_tokens=n_train, val_tokens=n_val, vocab_size=tok.vocab_size, tokenizer=tok.fingerprint)
+    with open(meta_path + ".tmp", "w") as f:
+        json.dump(meta, f)
+    os.replace(meta_path + ".tmp", meta_path)
     print(f"[✓] Train {n_train:,} tokens | Val {n_val:,} tokens")
 
 

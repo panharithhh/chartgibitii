@@ -17,10 +17,10 @@ from ..data.hf import maybe_hf_login, open_hf_stream
 from ..data.sources import SFT_SOURCES
 from ..data.tokenizer import KhmerTokenizer
 from ..model.lm import build_model
-from ..runtime import Runtime, barrier, free_memory
+from ..runtime import Runtime, barrier, free_memory, time_left
 from ..text import clean_multiline, khmer_ratio
 from ..train.checkpoint import first_existing, load_model_weights, save_inference_weights
-from ..train.loop import run_training, wrap_model
+from ..train.loop import any_rank, run_training, wrap_model
 
 SFT_SAMPLE_QUESTIONS = [
     "តើរាជធានីនៃប្រទេសកម្ពុជាគឺជាអ្វី?",          # What is the capital of Cambodia?
@@ -97,7 +97,7 @@ def extract_qa(row: dict, window: int = QA_CONTEXT_CHARS) -> Optional[dict]:
 
 def harvest_sft_examples(cfg: Config) -> str:
     path, done_flag = cfg.sft_jsonl_path, cfg.sft_jsonl_path + ".done"
-    if os.path.exists(path) and os.path.exists(done_flag):
+    if os.path.exists(path) and os.path.exists(done_flag) and os.path.getsize(path) > 0:
         print(f"[✓] SFT examples found at {path}. Skipping download.")
         return path
     maybe_hf_login()
@@ -134,8 +134,10 @@ def harvest_sft_examples(cfg: Config) -> str:
         raise RuntimeError("No SFT examples downloaded. Turn on Internet, edit SFT_SOURCES "
                            "or set Config.sft_custom_jsonl.")
     os.replace(path + ".tmp", path)
-    with open(done_flag, "w") as fl:
-        fl.write(str(total))
+    if total > 0:   # an empty (offline) download must not block fetching next time
+        with open(done_flag + ".tmp", "w") as fl:
+            fl.write(str(total))
+        os.replace(done_flag + ".tmp", done_flag)
     return path
 
 
@@ -175,17 +177,17 @@ def pack_examples(examples, row_len: int, pad_id: int, eos_id: int) -> Tuple[np.
             np.asarray(rows_m, dtype=np.uint8).reshape(-1, row_len))
 
 
-def _sft_fingerprint(cfg: Config) -> str:
+def _sft_fingerprint(cfg: Config, tok: KhmerTokenizer) -> str:
     custom = cfg.sft_custom_jsonl
     stat = os.stat(custom) if custom and os.path.exists(custom) else None
     return json.dumps(dict(custom=custom, custom_mtime=stat.st_mtime if stat else None,
                            custom_size=stat.st_size if stat else None, repeat=cfg.sft_custom_repeat,
-                           ctx=cfg.context_length, vocab=cfg.vocab_size, system=SFT_SYSTEM_PROMPT,
+                           ctx=cfg.context_length, tokenizer=tok.fingerprint, system=SFT_SYSTEM_PROMPT,
                            hf_size=os.path.getsize(cfg.sft_jsonl_path)))
 
 
 def prepare_sft_data(cfg: Config, tok: KhmerTokenizer):
-    fingerprint = _sft_fingerprint(cfg)
+    fingerprint = _sft_fingerprint(cfg, tok)
     if os.path.exists(cfg.sft_packed_path):
         with np.load(cfg.sft_packed_path) as old:
             if "fingerprint" in old.files and str(old["fingerprint"]) == fingerprint:
@@ -208,23 +210,28 @@ def prepare_sft_data(cfg: Config, tok: KhmerTokenizer):
             if built is not None:
                 is_val = zlib.crc32(ex["instruction"].encode("utf-8")) % cfg.sft_val_every_n == 0
                 (val_ex if is_val else train_ex).append(built)
-    n_custom = 0
-    if cfg.sft_custom_jsonl:
-        for ex in read_custom_examples(cfg.sft_custom_jsonl):   # all custom examples train, upsampled
-            built = build(ex)
-            if built is not None:
-                train_ex.extend([built] * cfg.sft_custom_repeat)
-                n_custom += 1
-        print(f"     + {n_custom:,} custom examples x{cfg.sft_custom_repeat} from {cfg.sft_custom_jsonl}")
-    if len(val_ex) < 8:   # tiny dataset -> carve validation out of train
-        n_val = max(8, len(train_ex) // 50)
-        val_ex, train_ex = train_ex[:n_val], train_ex[n_val:]
     rng = np.random.default_rng(cfg.seed)
     train_ex = [train_ex[i] for i in rng.permutation(len(train_ex))]
+    if len(val_ex) < 8 and train_ex:   # small download: move a few distinct examples to validation
+        n_val = min(max(8, len(train_ex) // 50), len(train_ex) // 2)
+        val_ex, train_ex = val_ex + train_ex[:n_val], train_ex[n_val:]
+    custom = []
+    if cfg.sft_custom_jsonl:
+        custom = [b for b in map(build, read_custom_examples(cfg.sft_custom_jsonl)) if b is not None]
+        train_ex += [b for b in custom for _ in range(cfg.sft_custom_repeat)]   # all custom data is trained on
+        print(f"     + {len(custom):,} custom examples x{cfg.sft_custom_repeat} from {cfg.sft_custom_jsonl}")
+        if not val_ex:   # custom-only: monitor on (copies of) a few custom examples
+            val_ex = custom[:8]
+    if not train_ex:
+        raise RuntimeError("No usable SFT examples (all empty or longer than context_length).")
+    train_ex = [train_ex[i] for i in rng.permutation(len(train_ex))]
     tr_t, tr_m = pack_examples(train_ex, cfg.context_length + 1, tok.pad_id, tok.eos_id)
-    va_t, va_m = pack_examples(val_ex, cfg.context_length + 1, tok.pad_id, tok.eos_id)
-    np.savez(cfg.sft_packed_path, train_tokens=tr_t, train_mask=tr_m, val_tokens=va_t, val_mask=va_m,
-             fingerprint=np.array(fingerprint))
+    va_t, va_m = pack_examples(val_ex or train_ex[:8], cfg.context_length + 1, tok.pad_id, tok.eos_id)
+    tmp = cfg.sft_packed_path + ".tmp"
+    with open(tmp, "wb") as f:   # write-then-rename (see atomic_torch_save)
+        np.savez(f, train_tokens=tr_t, train_mask=tr_m, val_tokens=va_t, val_mask=va_m,
+                 fingerprint=np.array(fingerprint))
+    os.replace(tmp, cfg.sft_packed_path)
     print(f"[✓] SFT: {len(train_ex):,} train / {len(val_ex):,} val examples -> {len(tr_t):,} / {len(va_t):,} "
           f"rows of {cfg.context_length} | dropped {dropped:,} too-long | answer tokens {int(tr_m.sum()):,}")
 
@@ -262,6 +269,10 @@ def sft_config(cfg: Config, n_train_rows: int, world_size: int) -> Config:
 
 
 def run_sft(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
+    if any_rank(not time_left(cfg), rt):
+        if rt.master:
+            print("[⏱] No time left for SFT; skipping (rerun with stages 'sft,rag' to continue).")
+        return
     if rt.master:
         harvest_sft_examples(cfg)
         prepare_sft_data(cfg, tok)
@@ -271,10 +282,29 @@ def run_sft(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
     barrier(rt)
     with np.load(cfg.sft_packed_path) as data:
         tr_t, tr_m, va_t, va_m = data["train_tokens"], data["train_mask"], data["val_tokens"], data["val_mask"]
-    scfg = sft_config(cfg, len(tr_t), rt.world_size)
+        data_fingerprint = str(data["fingerprint"])
+
+    # An SFT checkpoint only resumes if it was trained on this exact data (e.g. you added your own Q&A
+    # after a finished run): otherwise SFT restarts from the base model so the new data gets a full run.
+    data_marker = cfg.sft_ckpt_path + ".data"
+    resume = cfg.resume and os.path.exists(cfg.sft_ckpt_path)
+    previous = None
+    if os.path.exists(data_marker):
+        with open(data_marker) as f:
+            previous = f.read()
+    if resume and previous != data_fingerprint:
+        resume = False
+        if rt.master:
+            print("[↻] SFT data changed since the last SFT run; restarting SFT from the base model.")
+    barrier(rt)   # every rank decided before the marker is rewritten
+    if rt.master:
+        with open(data_marker + ".tmp", "w") as f:
+            f.write(data_fingerprint)
+        os.replace(data_marker + ".tmp", data_marker)
+    scfg = replace(sft_config(cfg, len(tr_t), rt.world_size), resume=resume)
 
     raw_model = build_model(cfg, rt)
-    if not (cfg.resume and os.path.exists(cfg.sft_ckpt_path)):
+    if not resume:
         # prefer the fp32 training checkpoint over the half-precision inference copy
         base = first_existing([cfg.pretrained_ckpt, cfg.ckpt_path, cfg.final_path])
         if base is None:
@@ -288,10 +318,12 @@ def run_sft(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
     train_loader = SFTLoader(tr_t, tr_m, cfg.batch_size, rt.device, cfg.seed + rt.rank)
     val_loader = SFTLoader(va_t, va_m, cfg.batch_size, rt.device, cfg.seed + 30_000)
     sample_fn = lambda: chat(raw_model, tok, SFT_SAMPLE_QUESTIONS[0], rt, max_new_tokens=64)
-    run_training(scfg, rt, model, raw_model, train_loader, {"val": val_loader}, cfg.sft_ckpt_path,
-                 sample_fn, "POST-TRAIN (SFT)")
+    step = run_training(scfg, rt, model, raw_model, train_loader, {"val": val_loader}, cfg.sft_ckpt_path,
+                        sample_fn, "POST-TRAIN (SFT)")
 
-    if rt.master:
+    if rt.master and step == 0:
+        print("[!] No SFT steps ran; chat model weights not written.")
+    elif rt.master:
         save_inference_weights(cfg.sft_final_path, raw_model, scfg, tok.model_file, rt)
         print(f"[✓] Chat model weights: {cfg.sft_final_path}")
         for q in SFT_SAMPLE_QUESTIONS:
