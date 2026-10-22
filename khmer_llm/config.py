@@ -32,7 +32,7 @@ class Config:
     # ---- pretraining ----
     batch_size: int = 8                # micro-batch per GPU (fits a 16 GB T4)
     grad_accum_steps: int = 4          # 8 x 1024 x 4 = 32k tokens / step / GPU
-    max_iters: int = 6000
+    max_iters: int = 20000             # ~655M tokens on 1 GPU (2x with 2 GPUs); runs resume across sessions
     warmup_iters: int = 200
     lr: float = 2e-3                   # shared peak LR (Muon is RMS-matched to AdamW)
     min_lr_ratio: float = 0.1
@@ -79,9 +79,10 @@ class Config:
     # ---- data ----
     work_dir: str = "/kaggle/working" if os.path.isdir("/kaggle/working") else "outputs"
     import_dir: Optional[str] = None   # e.g. /kaggle/input/<prev-run-output>: files are linked into work_dir
-    max_harvest_lines: int = 4_000_000
-    max_seconds_per_source: int = 1800
-    tokenizer_sample_lines: int = 2_000_000
+    max_corpus_chars: int = 4_000_000_000   # ~1.1-1.3B tokens; stored gzipped (~4 GB on disk)
+    max_harvest_hours: float = 4.0         # stop downloading after this long (sources are tried in order)
+    max_seconds_per_source: int = 5400
+    tokenizer_sample_lines: int = 2_000_000   # uniform sample over all harvested lines
     val_every_n_lines: int = 200       # ~0.5% of lines (hash-based) go to validation
 
     @property
@@ -98,7 +99,11 @@ class Config:
 
     @property
     def corpus_path(self) -> str:
-        return self.path("khmer_corpus.txt")
+        return self.path("khmer_corpus.txt.gz")
+
+    @property
+    def tokenizer_sample_path(self) -> str:
+        return self.path("khmer_tokenizer_sample.txt.gz")
 
     @property
     def tokenizer_prefix(self) -> str:

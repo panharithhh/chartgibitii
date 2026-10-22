@@ -22,7 +22,8 @@ STAGES = ("pretrain", "sft", "rag")
 def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
     """Loads the tokenizer, harvesting the corpus and training it first if it is missing."""
     if rt.master and not os.path.exists(cfg.tokenizer_prefix + ".model"):
-        KhmerTokenizer(cfg, harvest_khmer_corpus(cfg))
+        harvest_khmer_corpus(cfg)
+        KhmerTokenizer(cfg, cfg.tokenizer_sample_path)
     barrier(rt)
     tok = KhmerTokenizer(cfg)
     assert tok.vocab_size == cfg.vocab_size, f"tokenizer vocab {tok.vocab_size} != config {cfg.vocab_size}"

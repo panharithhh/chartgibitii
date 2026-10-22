@@ -38,6 +38,13 @@ def run_pretrain(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
         print(f"     {cfg.n_layers} layers ({cfg.n_dense_layers} dense) | d_model {cfg.d_model} "
               f"| {cfg.n_heads}Q/{cfg.n_kv_heads}KV heads | {cfg.n_shared_experts} shared + "
               f"{cfg.n_routed_experts} routed experts (top-{cfg.top_k}) | ctx {cfg.context_length}")
+        corpus_tokens = os.path.getsize(cfg.train_bin) // 2
+        planned = cfg.max_iters * cfg.batch_size * T * cfg.grad_accum_steps * rt.world_size
+        print(f"[📊] Corpus {corpus_tokens / 1e6:,.0f}M tokens | max_iters={cfg.max_iters:,} trains on "
+              f"{planned / 1e6:,.0f}M tokens = {planned / max(1, corpus_tokens):.2f} epochs")
+        if planned < 0.5 * corpus_tokens:
+            print(f"     tip: most of the data is unused; max_iters={int(corpus_tokens / (planned / cfg.max_iters)):,} "
+                  f"would see it all once (it resumes across Kaggle sessions)")
     model = wrap_model(raw_model, cfg, rt)
     sample_fn = lambda: generate(raw_model, tok, PRETRAIN_SAMPLE_PROMPTS[1], rt, max_new_tokens=48)
     step = run_training(cfg, rt, model, raw_model, train_loader,

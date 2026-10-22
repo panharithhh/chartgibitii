@@ -60,7 +60,7 @@ class Config:
     # ---- pretraining ----
     batch_size: int = 8                # micro-batch per GPU (fits a 16 GB T4)
     grad_accum_steps: int = 4          # 8 x 1024 x 4 = 32k tokens / step / GPU
-    max_iters: int = 6000
+    max_iters: int = 20000             # ~655M tokens on 1 GPU (2x with 2 GPUs); runs resume across sessions
     warmup_iters: int = 200
     lr: float = 2e-3                   # shared peak LR (Muon is RMS-matched to AdamW)
     min_lr_ratio: float = 0.1
@@ -107,9 +107,10 @@ class Config:
     # ---- data ----
     work_dir: str = "/kaggle/working" if os.path.isdir("/kaggle/working") else "outputs"
     import_dir: Optional[str] = None   # e.g. /kaggle/input/<prev-run-output>: files are linked into work_dir
-    max_harvest_lines: int = 4_000_000
-    max_seconds_per_source: int = 1800
-    tokenizer_sample_lines: int = 2_000_000
+    max_corpus_chars: int = 4_000_000_000   # ~1.1-1.3B tokens; stored gzipped (~4 GB on disk)
+    max_harvest_hours: float = 4.0         # stop downloading after this long (sources are tried in order)
+    max_seconds_per_source: int = 5400
+    tokenizer_sample_lines: int = 2_000_000   # uniform sample over all harvested lines
     val_every_n_lines: int = 200       # ~0.5% of lines (hash-based) go to validation
 
     @property
@@ -126,7 +127,11 @@ class Config:
 
     @property
     def corpus_path(self) -> str:
-        return self.path("khmer_corpus.txt")
+        return self.path("khmer_corpus.txt.gz")
+
+    @property
+    def tokenizer_sample_path(self) -> str:
+        return self.path("khmer_tokenizer_sample.txt.gz")
 
     @property
     def tokenizer_prefix(self) -> str:
@@ -317,9 +322,13 @@ def free_memory():
         torch.cuda.empty_cache()
 
 
+def hours_left(cfg: Config) -> float:
+    """Hours left of cfg.max_train_hours for the whole run (all stages)."""
+    return cfg.max_train_hours - (time.time() - _START_TIME) / 3600
+
+
 def time_left(cfg: Config) -> bool:
-    """True while the whole run (all stages) is inside cfg.max_train_hours."""
-    return (time.time() - _START_TIME) / 3600 < cfg.max_train_hours
+    return hours_left(cfg) > 0
 
 
 def link_previous_outputs(cfg: Config):
@@ -581,6 +590,7 @@ SFT_SOURCES = [
 # khmer_llm/data/tokenizer.py
 # ======================================================================================
 """SentencePiece Unigram tokenizer with byte fallback and atomic chat-marker tokens."""
+import gzip
 import os
 import zlib
 from typing import List, Optional
@@ -591,14 +601,23 @@ import sentencepiece as spm
 CHAT_SYMBOLS = ["<|system|>", "<|context|>", "<|user|>", "<|assistant|>"]
 
 
+def _iter_gz_lines(path: str):
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield line.rstrip("\n")
+
+
 class KhmerTokenizer:
     def __init__(self, cfg: Config, corpus_path: Optional[str] = None):
         self.model_file = cfg.tokenizer_prefix + ".model"
         if not os.path.exists(self.model_file):
             assert corpus_path is not None, "tokenizer missing and no corpus to train on"
             print(f"\n[🔧] Training SentencePiece Unigram tokenizer ({cfg.vocab_size:,} vocab)...")
+            source = dict(input=corpus_path) if not corpus_path.endswith(".gz") else \
+                dict(sentence_iterator=_iter_gz_lines(corpus_path))   # SentencePiece cannot read .gz itself
             spm.SentencePieceTrainer.train(
-                input=corpus_path,
+                **source,
                 model_prefix=cfg.tokenizer_prefix,
                 vocab_size=cfg.vocab_size,
                 model_type="unigram",
@@ -659,12 +678,15 @@ class KhmerTokenizer:
 # ======================================================================================
 # khmer_llm/data/corpus.py
 # ======================================================================================
-"""Pretraining data: stream + clean + dedup the Khmer corpus, tokenize to uint16 bins, batch."""
+"""Pretraining data: stream + clean + dedup the Khmer corpus (gzipped), tokenize to uint16 bins, batch."""
+import gzip
+import itertools
 import json
 import os
+import random
 import time
 import zlib
-from typing import List, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -672,27 +694,51 @@ from tqdm.auto import tqdm
 
 
 
+def open_text(path: str, mode: str = "rt", gz: Optional[bool] = None):
+    """Opens .gz transparently (the corpus is stored gzipped: Khmer is 3 bytes/char in UTF-8).
+    gz overrides the suffix check, e.g. for a temp file that will be renamed to *.gz."""
+    if path.endswith(".gz") if gz is None else gz:
+        return gzip.open(path, mode, encoding="utf-8", **({"compresslevel": 3} if "w" in mode else {}))
+    return open(path, mode, encoding="utf-8")
+
+
+def iter_lines(path: str) -> Iterator[str]:
+    with open_text(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line:
+                yield line
+
+
 def harvest_khmer_corpus(cfg: Config) -> str:
+    """
+    Streams every source in HARVEST_SOURCES into one gzipped, line-deduplicated corpus until
+    cfg.max_corpus_chars (or the harvest time budget) is reached. Also keeps a uniform reservoir
+    sample over ALL harvested lines for tokenizer training, so the vocabulary matches the mix.
+    """
     out_path, done_flag = cfg.corpus_path, cfg.corpus_path + ".done"
     if os.path.exists(out_path) and os.path.exists(done_flag):
-        print(f"[✓] Corpus found at {out_path} ({os.path.getsize(out_path) / 2**20:.1f} MB). Skipping harvest.")
+        print(f"[✓] Corpus found at {out_path} ({os.path.getsize(out_path) / 2**30:.2f} GB gz). Skipping harvest.")
         return out_path
 
     maybe_hf_login()
-    print("\n[📥] Streaming Khmer corpora from HuggingFace...")
-    seen, total = set(), 0
+    print(f"\n[📥] Streaming Khmer corpora from HuggingFace (budget {cfg.max_corpus_chars / 1e9:.1f}B chars, "
+          f"{cfg.max_harvest_hours:g} h)...")
+    rng = random.Random(cfg.seed)
+    reservoir, n_seen = [], 0
+    seen, total_chars, total_lines, stats = set(), 0, 0, {}
+    t_harvest = time.time()
     tmp_path = out_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    with open_text(tmp_path, "wt", gz=out_path.endswith(".gz")) as f:
         for src in HARVEST_SOURCES:
-            budget = cfg.max_harvest_lines - total
-            if budget <= 0:
+            if total_chars >= cfg.max_corpus_chars or time.time() - t_harvest > cfg.max_harvest_hours * 3600:
+                print(f"  -> budget reached; skipping the remaining sources (from {src['name']})")
                 break
-            if src.get("cap"):
-                budget = min(budget, src["cap"])
-            n_src, t0 = 0, time.time()
+            cap = src.get("cap") or float("inf")
+            n_src, c_src, t0 = 0, 0, time.time()
             try:
-                label, ds = open_hf_stream(src["loads"])
-                print(f"  -> {src['name']} [{label}] (budget {budget:,} lines)")
+                label, ds = open_hf_stream(src["loads"], src.get("require"))
+                print(f"  -> {src['name']} [{label}]")
                 for row in ds:
                     for line in text_to_lines(row_text(row, src.get("fields"), src.get("sep", "\n"))):
                         h = hash(line)
@@ -701,24 +747,48 @@ def harvest_khmer_corpus(cfg: Config) -> str:
                         seen.add(h)
                         f.write(line + "\n")
                         n_src += 1
-                        if n_src % 200_000 == 0:
-                            print(f"     ... {n_src:,} lines ({time.time() - t0:.0f}s)")
-                        if n_src >= budget:
-                            break
-                    if n_src >= budget or time.time() - t0 > cfg.max_seconds_per_source:
+                        c_src += len(line)
+                        n_seen += 1   # reservoir sampling (Algorithm R) for the tokenizer sample
+                        if len(reservoir) < cfg.tokenizer_sample_lines:
+                            reservoir.append(line)
+                        else:
+                            j = rng.randrange(n_seen)
+                            if j < cfg.tokenizer_sample_lines:
+                                reservoir[j] = line
+                        if n_src % 500_000 == 0:
+                            print(f"     ... {n_src:,} lines, {c_src / 1e6:,.0f}M chars ({time.time() - t0:.0f}s)")
+                    if (n_src >= cap or total_chars + c_src >= cfg.max_corpus_chars
+                            or time.time() - t0 > cfg.max_seconds_per_source):
                         break
             except Exception as e:   # gated / renamed / network error -> keep what we have
                 print(f"  -> {src['name']}: [x] stopped: {type(e).__name__}: {str(e)[:300]}")
-            total += n_src
-            print(f"     [✓] +{n_src:,} lines | total {total:,} | {time.time() - t0:.0f}s")
+            total_chars += c_src
+            total_lines += n_src
+            stats[src["name"]] = dict(lines=n_src, chars=c_src)
+            print(f"     [✓] +{n_src:,} lines / {c_src / 1e6:,.0f}M chars | total {total_chars / 1e9:.2f}B chars "
+                  f"| {time.time() - t0:.0f}s")
 
-    if total == 0:
+    if total_lines == 0:
         raise RuntimeError("No Khmer text harvested. Turn on Internet in the Kaggle notebook settings.")
+    with open_text(cfg.tokenizer_sample_path + ".tmp", "wt", gz=cfg.tokenizer_sample_path.endswith(".gz")) as fs:
+        fs.writelines(line + "\n" for line in reservoir)
+    os.replace(cfg.tokenizer_sample_path + ".tmp", cfg.tokenizer_sample_path)
     os.replace(tmp_path, out_path)
-    with open(done_flag, "w") as fl:
-        fl.write(str(total))
-    print(f"[✓] Saved {total:,} deduplicated lines to {out_path} ({os.path.getsize(out_path) / 2**20:.1f} MB)")
+    with open(done_flag + ".tmp", "w") as fl:
+        json.dump(dict(lines=total_lines, chars=total_chars, sources=stats), fl, ensure_ascii=False, indent=1)
+    os.replace(done_flag + ".tmp", done_flag)
+    print(f"[✓] Corpus: {total_lines:,} deduplicated lines, {total_chars / 1e9:.2f}B chars "
+          f"-> {out_path} ({os.path.getsize(out_path) / 2**30:.2f} GB gz)")
     return out_path
+
+
+def _flatten_with_eos(seqs: List[List[int]], eos_id: int) -> np.ndarray:
+    """[[a, b], [c]] -> [a, b, EOS, c, EOS] as uint16, without a per-token Python loop."""
+    if not seqs:
+        return np.zeros(0, dtype=np.uint16)
+    lengths = np.fromiter((len(s) for s in seqs), dtype=np.int64, count=len(seqs))
+    flat = np.fromiter(itertools.chain.from_iterable(seqs), dtype=np.uint16, count=int(lengths.sum()))
+    return np.insert(flat, np.cumsum(lengths), eos_id)
 
 
 def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
@@ -733,27 +803,24 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
     assert tok.vocab_size < 2**16, "uint16 bins need vocab < 65536"
     print("\n[🔄] Tokenizing corpus -> uint16 memmap bins...")
     n_train = n_val = 0
-    with open(cfg.corpus_path, encoding="utf-8") as fin, \
-         open(cfg.train_bin + ".tmp", "wb") as ft, open(cfg.val_bin + ".tmp", "wb") as fv:
+    with open(cfg.train_bin + ".tmp", "wb") as ft, open(cfg.val_bin + ".tmp", "wb") as fv:
 
         def flush(lines: List[str]):
             nonlocal n_train, n_val
             tr, va = [], []
             for line, ids in zip(lines, tok.encode_batch(lines)):
-                dst = va if zlib.crc32(line.encode("utf-8")) % cfg.val_every_n_lines == 0 else tr
-                dst.extend(ids)
-                dst.append(tok.eos_id)          # EOS separates documents
-            np.asarray(tr, dtype=np.uint16).tofile(ft)
-            np.asarray(va, dtype=np.uint16).tofile(fv)
-            n_train += len(tr)
-            n_val += len(va)
+                if ids:
+                    (va if zlib.crc32(line.encode("utf-8")) % cfg.val_every_n_lines == 0 else tr).append(ids)
+            tr_arr, va_arr = _flatten_with_eos(tr, tok.eos_id), _flatten_with_eos(va, tok.eos_id)   # EOS ends a doc
+            tr_arr.tofile(ft)
+            va_arr.tofile(fv)
+            n_train += len(tr_arr)
+            n_val += len(va_arr)
 
         batch = []
-        for line in tqdm(fin, desc="Tokenizing", unit=" lines", mininterval=10):
-            line = line.rstrip("\n")
-            if line:
-                batch.append(line)
-            if len(batch) >= 50_000:
+        for line in tqdm(iter_lines(cfg.corpus_path), desc="Tokenizing", unit=" lines", mininterval=10):
+            batch.append(line)
+            if len(batch) >= 100_000:
                 flush(batch)
                 batch = []
         if batch:
@@ -1404,7 +1471,7 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
     batch = train_loader.get()
     t_log = time.time()
     loss_acc, n_acc, step, load = torch.zeros((), device=rt.device), 0, start_step, None
-    saved_step = start_step
+    saved_step, eta_shown = start_step, False
 
     while step < cfg.max_iters:
         batch, loss_sum, grad_norm, load, mult = train_step(
@@ -1422,6 +1489,13 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
                       f"| {n_acc * tokens_per_step / dt:,.0f} tok/s"
                       f"{' | scale %.0f' % scaler.get_scale() if scaler.is_enabled() else ''}"
                       f"{load_summary(load)}")
+            if rt.master and not eta_shown and step - start_step >= 2 * cfg.log_interval:
+                eta_shown = True   # after warm-up of the timer: how long the rest takes vs the time budget
+                tok_s = n_acc * tokens_per_step / max(dt, 1e-9)
+                need, left = (cfg.max_iters - step) * tokens_per_step / tok_s / 3600, hours_left(cfg)
+                print(f"  [eta] ~{need:.1f} h for the remaining {cfg.max_iters - step:,} steps at {tok_s:,.0f} tok/s"
+                      + (f"; only {left:.1f} h of budget left -> it will save and stop, continue next session "
+                         f"with Config(import_dir=...)" if need > left else ""))
             loss_acc.zero_()
             n_acc, t_log = 0, time.time()
             if stop:
@@ -1563,6 +1637,13 @@ def run_pretrain(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
         print(f"     {cfg.n_layers} layers ({cfg.n_dense_layers} dense) | d_model {cfg.d_model} "
               f"| {cfg.n_heads}Q/{cfg.n_kv_heads}KV heads | {cfg.n_shared_experts} shared + "
               f"{cfg.n_routed_experts} routed experts (top-{cfg.top_k}) | ctx {cfg.context_length}")
+        corpus_tokens = os.path.getsize(cfg.train_bin) // 2
+        planned = cfg.max_iters * cfg.batch_size * T * cfg.grad_accum_steps * rt.world_size
+        print(f"[📊] Corpus {corpus_tokens / 1e6:,.0f}M tokens | max_iters={cfg.max_iters:,} trains on "
+              f"{planned / 1e6:,.0f}M tokens = {planned / max(1, corpus_tokens):.2f} epochs")
+        if planned < 0.5 * corpus_tokens:
+            print(f"     tip: most of the data is unused; max_iters={int(corpus_tokens / (planned / cfg.max_iters)):,} "
+                  f"would see it all once (it resumes across Kaggle sessions)")
     model = wrap_model(raw_model, cfg, rt)
     sample_fn = lambda: generate(raw_model, tok, PRETRAIN_SAMPLE_PROMPTS[1], rt, max_new_tokens=48)
     step = run_training(cfg, rt, model, raw_model, train_loader,
@@ -1959,7 +2040,7 @@ def load_rag_documents(cfg: Config) -> List[Tuple[str, str]]:
         if cfg.rag_docs_dir:
             print(f"[!] rag_docs_dir {cfg.rag_docs_dir} not found; using the harvested corpus instead.")
         group, start = [], 0
-        with open(cfg.corpus_path, encoding="utf-8") as f:
+        with open_text(cfg.corpus_path) as f:
             for i, line in enumerate(f):
                 if i >= cfg.rag_max_corpus_lines:
                     break
@@ -2501,7 +2582,8 @@ STAGES = ("pretrain", "sft", "rag")
 def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
     """Loads the tokenizer, harvesting the corpus and training it first if it is missing."""
     if rt.master and not os.path.exists(cfg.tokenizer_prefix + ".model"):
-        KhmerTokenizer(cfg, harvest_khmer_corpus(cfg))
+        harvest_khmer_corpus(cfg)
+        KhmerTokenizer(cfg, cfg.tokenizer_sample_path)
     barrier(rt)
     tok = KhmerTokenizer(cfg)
     assert tok.vocab_size == cfg.vocab_size, f"tokenizer vocab {tok.vocab_size} != config {cfg.vocab_size}"

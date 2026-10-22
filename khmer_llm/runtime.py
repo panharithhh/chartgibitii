@@ -107,9 +107,13 @@ def free_memory():
         torch.cuda.empty_cache()
 
 
+def hours_left(cfg: Config) -> float:
+    """Hours left of cfg.max_train_hours for the whole run (all stages)."""
+    return cfg.max_train_hours - (time.time() - _START_TIME) / 3600
+
+
 def time_left(cfg: Config) -> bool:
-    """True while the whole run (all stages) is inside cfg.max_train_hours."""
-    return (time.time() - _START_TIME) / 3600 < cfg.max_train_hours
+    return hours_left(cfg) > 0
 
 
 def link_previous_outputs(cfg: Config):

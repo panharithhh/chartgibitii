@@ -50,3 +50,35 @@ def test_chunking_never_splits_khmer_clusters():
     assert len(chunks) > 3
     for c in chunks:
         assert not KHMER_SIGN_RE.match(c[0]) and c[-1] != COENG and len(c) <= 97
+
+
+def test_harvest_writes_gz_corpus_with_budget_dedup_and_sample(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    import gzip
+    import json
+    import khmer_llm.data.corpus as corpus
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    a.write_text("\n".join(json.dumps({"text": f"{KH}{i}។\n{KH}។"}) for i in range(300)), encoding="utf-8")
+    b.write_text("\n".join(json.dumps({"body": f"{KH}ខ{i}។"}) for i in range(300)), encoding="utf-8")
+    monkeypatch.setattr(corpus, "HARVEST_SOURCES", [
+        dict(name="A", loads=[dict(path="json", data_files=str(a))], fields=["text"]),
+        dict(name="B", loads=[dict(path="json", data_files=str(b))], fields=None),   # unknown schema
+        dict(name="C", loads=[dict(path="json", data_files=str(a))], fields=["text"]),
+    ])
+    cfg = Config(work_dir=str(tmp_path), max_corpus_chars=12_000, tokenizer_sample_lines=50)
+    corpus.harvest_khmer_corpus(cfg)
+    lines = list(corpus.iter_lines(cfg.corpus_path))
+    assert len(lines) == len(set(lines)) and f"{KH}។" in lines            # exact dedup across rows
+    assert 12_000 <= sum(map(len, lines)) < 12_000 + 2 * 40               # stops at the char budget
+    stats = json.load(open(cfg.corpus_path + ".done"))
+    assert stats["sources"]["A"]["lines"] > 0 and "C" not in stats["sources"]   # budget reached before C
+    with gzip.open(cfg.tokenizer_sample_path, "rt", encoding="utf-8") as f:
+        sample = f.read().split("\n")[:-1]
+    assert len(sample) == 50 and set(sample) <= set(lines)
+    corpus.harvest_khmer_corpus(cfg)   # second call is a no-op (done flag)
+
+
+def test_flatten_with_eos():
+    from khmer_llm.data.corpus import _flatten_with_eos
+    assert _flatten_with_eos([[5, 6], [7], [8, 9, 10]], 2).tolist() == [5, 6, 2, 7, 2, 8, 9, 10, 2]
+    assert _flatten_with_eos([], 2).tolist() == []

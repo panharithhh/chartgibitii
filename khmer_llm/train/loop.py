@@ -12,7 +12,7 @@ from ..config import Config
 from ..model.layers import MoE
 from ..model.lm import KimiMoELM
 from ..optim.hybrid import build_optimizers, lr_mult
-from ..runtime import Runtime, autocast_ctx, make_scaler, time_left
+from ..runtime import Runtime, autocast_ctx, hours_left, make_scaler, time_left
 from .checkpoint import load_checkpoint, save_checkpoint
 
 
@@ -134,7 +134,7 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
     batch = train_loader.get()
     t_log = time.time()
     loss_acc, n_acc, step, load = torch.zeros((), device=rt.device), 0, start_step, None
-    saved_step = start_step
+    saved_step, eta_shown = start_step, False
 
     while step < cfg.max_iters:
         batch, loss_sum, grad_norm, load, mult = train_step(
@@ -152,6 +152,13 @@ def run_training(cfg: Config, rt: Runtime, model, raw_model: KimiMoELM, train_lo
                       f"| {n_acc * tokens_per_step / dt:,.0f} tok/s"
                       f"{' | scale %.0f' % scaler.get_scale() if scaler.is_enabled() else ''}"
                       f"{load_summary(load)}")
+            if rt.master and not eta_shown and step - start_step >= 2 * cfg.log_interval:
+                eta_shown = True   # after warm-up of the timer: how long the rest takes vs the time budget
+                tok_s = n_acc * tokens_per_step / max(dt, 1e-9)
+                need, left = (cfg.max_iters - step) * tokens_per_step / tok_s / 3600, hours_left(cfg)
+                print(f"  [eta] ~{need:.1f} h for the remaining {cfg.max_iters - step:,} steps at {tok_s:,.0f} tok/s"
+                      + (f"; only {left:.1f} h of budget left -> it will save and stop, continue next session "
+                         f"with Config(import_dir=...)" if need > left else ""))
             loss_acc.zero_()
             n_acc, t_log = 0, time.time()
             if stop:

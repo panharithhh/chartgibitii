@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from ..chat import build_chat_example, chat
 from ..config import Config, with_architecture_of
+from ..data.corpus import open_text
 from ..data.tokenizer import KhmerTokenizer
 from ..model.lm import KimiMoELM, build_model
 from ..runtime import Runtime, ensure_package, link_previous_outputs, setup_runtime
@@ -55,7 +56,7 @@ def load_rag_documents(cfg: Config) -> List[Tuple[str, str]]:
         if cfg.rag_docs_dir:
             print(f"[!] rag_docs_dir {cfg.rag_docs_dir} not found; using the harvested corpus instead.")
         group, start = [], 0
-        with open(cfg.corpus_path, encoding="utf-8") as f:
+        with open_text(cfg.corpus_path) as f:
             for i, line in enumerate(f):
                 if i >= cfg.rag_max_corpus_lines:
                     break

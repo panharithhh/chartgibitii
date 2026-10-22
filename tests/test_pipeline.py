@@ -1,4 +1,5 @@
 """End-to-end: tokenizer -> pretrain -> SFT -> RAG on a tiny offline setup (no HF downloads)."""
+import gzip
 import json
 import os
 import random
@@ -32,8 +33,10 @@ def _write_offline_inputs(work: pathlib.Path, docs: pathlib.Path):
     vocab = WORDS + _random_khmer_words(rnd, 400)   # enough variety for a 400-piece tokenizer
     lines = [" ".join(rnd.choice(vocab) for _ in range(rnd.randint(5, 25))) + "។" for _ in range(6000)]
     lines += [ANGKOR, CAPITAL] * 50
-    (work / "khmer_corpus.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (work / "khmer_corpus.txt.done").write_text("x")
+    for name in ("khmer_corpus.txt.gz", "khmer_tokenizer_sample.txt.gz"):   # what harvest_khmer_corpus writes
+        with gzip.open(work / name, "wt", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    (work / "khmer_corpus.txt.gz.done").write_text("{}")
     sft = [dict(instruction=f"តើ{w}ជាអ្វី?", context="", response=f"{w} គឺជាពាក្យខ្មែរ។ " * 3) for w in WORDS] * 10
     sft += [dict(instruction="តើអង្គរវត្តនៅឯណា?", context=ANGKOR, response="នៅខេត្តសៀមរាប។")] * 20
     (work / "khmer_sft.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in sft) + "\n",

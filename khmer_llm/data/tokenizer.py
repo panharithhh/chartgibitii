@@ -1,4 +1,5 @@
 """SentencePiece Unigram tokenizer with byte fallback and atomic chat-marker tokens."""
+import gzip
 import os
 import zlib
 from typing import List, Optional
@@ -10,14 +11,23 @@ from ..config import Config
 CHAT_SYMBOLS = ["<|system|>", "<|context|>", "<|user|>", "<|assistant|>"]
 
 
+def _iter_gz_lines(path: str):
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield line.rstrip("\n")
+
+
 class KhmerTokenizer:
     def __init__(self, cfg: Config, corpus_path: Optional[str] = None):
         self.model_file = cfg.tokenizer_prefix + ".model"
         if not os.path.exists(self.model_file):
             assert corpus_path is not None, "tokenizer missing and no corpus to train on"
             print(f"\n[🔧] Training SentencePiece Unigram tokenizer ({cfg.vocab_size:,} vocab)...")
+            source = dict(input=corpus_path) if not corpus_path.endswith(".gz") else \
+                dict(sentence_iterator=_iter_gz_lines(corpus_path))   # SentencePiece cannot read .gz itself
             spm.SentencePieceTrainer.train(
-                input=corpus_path,
+                **source,
                 model_prefix=cfg.tokenizer_prefix,
                 vocab_size=cfg.vocab_size,
                 model_type="unigram",
