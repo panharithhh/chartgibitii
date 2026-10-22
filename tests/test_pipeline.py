@@ -65,6 +65,11 @@ def test_full_pipeline_offline(tmp_path, capsys):
                  rag_chunk_chars=120, rag_chunk_overlap_chars=30, rag_max_new_tokens=16,
                  run_self_test=False, tokenizer_sample_lines=10_000)
 
+    main(cfg, stages="data")   # CPU-only stage: tokenizer, token bins, SFT packing
+    for path in [cfg.tokenizer_prefix + ".model", cfg.train_bin, cfg.val_bin, cfg.sft_packed_path]:
+        assert os.path.exists(path), path
+    assert not os.path.exists(cfg.ckpt_path)
+
     results = main(cfg, stages="pretrain,sft,rag")
     for path in [cfg.final_path, cfg.sft_final_path, cfg.rag_index_path, cfg.sft_packed_path]:
         assert os.path.exists(path), path
@@ -108,6 +113,7 @@ def test_later_stages_fail_fast_on_empty_work_dir(tmp_path):
         with pytest.raises(FileNotFoundError):
             check_prerequisites(cfg, stages)
     check_prerequisites(cfg, ["pretrain", "sft", "rag"])   # pretrain makes everything it needs
+    check_prerequisites(cfg, ["data"])
 
 
 def test_cli_selftest_runs():

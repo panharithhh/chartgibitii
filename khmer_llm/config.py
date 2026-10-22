@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 @dataclass
 class Config:
     # ---- pipeline ----
-    stages: str = "pretrain,sft,rag"   # env KHMER_STAGES overrides, e.g. "sft,rag"
+    stages: str = "pretrain,sft,rag"   # env KHMER_STAGES overrides; "data" = download + tokenizer only (CPU)
     launch_ui: bool = False            # Gradio web page for customers at the end (public share link)
 
     # ---- model ----
@@ -78,9 +78,9 @@ class Config:
 
     # ---- data ----
     work_dir: str = "/kaggle/working" if os.path.isdir("/kaggle/working") else "outputs"
-    import_dir: Optional[str] = None   # e.g. /kaggle/input/<prev-run-output>: files are linked into work_dir
-    max_corpus_chars: int = 4_000_000_000   # ~1.1-1.3B tokens; stored gzipped (~4 GB on disk)
-    max_harvest_hours: float = 4.0         # stop downloading after this long (sources are tried in order)
+    import_dir: Optional[str] = None   # previous run outputs, comma-separated, newest first; linked into work_dir
+    max_corpus_chars: int = 6_000_000_000   # ~1.6-2B tokens; stored gzipped (~5 GB on disk)
+    max_harvest_hours: float = 5.0         # stop downloading after this long (sources are tried in order)
     max_seconds_per_source: int = 5400
     tokenizer_sample_lines: int = 2_000_000   # uniform sample over all harvested lines
     val_every_n_lines: int = 200       # ~0.5% of lines (hash-based) go to validation

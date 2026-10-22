@@ -50,9 +50,19 @@ tests/                     pytest suite (runs offline on CPU)
    ```
    `launch_ui=True` prints a public web link for customers.
 
-Kaggle stops after 12 hours, so long runs are split across sessions. Save the notebook version, add
-its output as an input, and run with `Config(import_dir="/kaggle/input/<that-output>")`. Every stage then
-resumes from its checkpoint. To skip stages that are already done, add `stages="sft,rag"`.
+#### Plan for the free tier (12 h sessions, ~30 GPU h per week)
+| Session | Hardware | Last line |
+|---|---|---|
+| 0: data | **CPU** (free, no GPU quota) | `main(Config(stages="data", sft_custom_jsonl=...))` downloads ~6B chars of Khmer text, trains the tokenizer, and builds token files and SFT data |
+| 1, 2, …: training | GPU T4 x2 | `main(Config(import_dir="/kaggle/input/<session-0-output>", sft_custom_jsonl=...))` |
+
+Each later session lists the newest output first: `import_dir="/kaggle/input/<gpu-run-1>,/kaggle/input/<data-run>"`.
+Every stage resumes from its checkpoint and saves before the 12 h cut. The log prints how many epochs of
+the corpus a run covers, plus an `[eta]` line.
+
+**Optional, more data:** CulturaX Khmer is gated. Accept its terms at huggingface.co/datasets/uonlp/CulturaX,
+then add your HF token as a Kaggle secret named `HF_TOKEN` (Add-ons → Secrets). Without it, CulturaX is
+skipped automatically.
 
 ### Local / server
 ```bash

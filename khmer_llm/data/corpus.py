@@ -1,5 +1,6 @@
 """Pretraining data: stream + clean + dedup the Khmer corpus (gzipped), tokenize to uint16 bins, batch."""
 import gzip
+import html
 import itertools
 import json
 import os
@@ -65,7 +66,10 @@ def harvest_khmer_corpus(cfg: Config) -> str:
                 label, ds = open_hf_stream(src["loads"], src.get("require"))
                 print(f"  -> {src['name']} [{label}]")
                 for row in ds:
-                    for line in text_to_lines(row_text(row, src.get("fields"), src.get("sep", "\n"))):
+                    raw = row_text(row, src.get("fields"), src.get("sep", "\n"))
+                    if src.get("unescape"):   # MADLAD-400 stores newlines as a literal backslash-n
+                        raw = html.unescape(raw.replace("\\n", "\n"))
+                    for line in text_to_lines(raw):
                         h = hash(line)
                         if h in seen:
                             continue

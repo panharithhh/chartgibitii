@@ -82,3 +82,40 @@ def test_flatten_with_eos():
     from khmer_llm.data.corpus import _flatten_with_eos
     assert _flatten_with_eos([[5, 6], [7], [8, 9, 10]], 2).tolist() == [5, 6, 2, 7, 2, 8, 9, 10, 2]
     assert _flatten_with_eos([], 2).tolist() == []
+
+
+def test_parse_json_spec_and_madlad_unescape(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    import json
+    import khmer_llm.data.corpus as corpus
+    from khmer_llm.data.hf import open_hf_stream
+    nested = tmp_path / "hplt.jsonl"   # nested / varying fields, like HPLT 3.0
+    nested.write_text("\n".join([json.dumps({"text": f"{KH}០។", "pii": [[1, 2]], "doc_scores": [0.5]}),
+                                 json.dumps({"text": f"{KH}១។", "web-register": {"a": 1}})]), encoding="utf-8")
+    label, rows = open_hf_stream([dict(path="text", data_files=[str(nested)], parse_json=True)], require=["text"])
+    assert "1 files" in label and [r["text"] for r in rows] == [f"{KH}០។", f"{KH}១។"]
+    madlad = tmp_path / "madlad.jsonl"
+    madlad.write_text(json.dumps({"text": f"{KH}ក។\\n{KH}ខ។ &amp; ok"}), encoding="utf-8")   # literal backslash-n
+    monkeypatch.setattr(corpus, "HARVEST_SOURCES", [
+        dict(name="M", loads=[dict(path="json", data_files=str(madlad))], fields=["text"], unescape=True)])
+    cfg = Config(work_dir=str(tmp_path / "w"))
+    import os
+    os.makedirs(cfg.work_dir)
+    corpus.harvest_khmer_corpus(cfg)
+    assert list(corpus.iter_lines(cfg.corpus_path)) == [f"{KH}ក។", f"{KH}ខ។ & ok"]
+
+
+def test_import_dir_accepts_several_folders_newest_first(tmp_path):
+    import os
+    from khmer_llm.runtime import link_previous_outputs
+    new, old = tmp_path / "gpu-run", tmp_path / "data-run"
+    new.mkdir()
+    old.mkdir()
+    (new / "ckpt.pt").write_text("new")
+    (old / "ckpt.pt").write_text("old")
+    (old / "train_16000.bin").write_text("bins")
+    (old / "x.pt.tmp").write_text("partial")
+    cfg = Config(work_dir=str(tmp_path / "work"), import_dir=f"{new}, {old}, {tmp_path / 'missing'}")
+    link_previous_outputs(cfg)
+    assert open(cfg.path("ckpt.pt")).read() == "new" and open(cfg.path("train_16000.bin")).read() == "bins"
+    assert not os.path.exists(cfg.path("x.pt.tmp"))

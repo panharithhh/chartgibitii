@@ -7,16 +7,16 @@ import torch
 import torch.distributed as dist
 
 from .config import Config
-from .data.corpus import harvest_khmer_corpus
+from .data.corpus import harvest_khmer_corpus, prepare_token_bins
 from .data.tokenizer import KhmerTokenizer
 from .runtime import RUNTIME_FLAGS, Runtime, barrier, link_previous_outputs, setup_runtime
 from .selftest import self_test
 from .stages.pretrain import run_pretrain
 from .stages.rag import run_rag
-from .stages.sft import run_sft
+from .stages.sft import harvest_sft_examples, prepare_sft_data, run_sft
 from .train.checkpoint import first_existing
 
-STAGES = ("pretrain", "sft", "rag")
+STAGES = ("data", "pretrain", "sft", "rag")
 
 
 def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
@@ -32,7 +32,7 @@ def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
 
 def check_prerequisites(cfg: Config, stage_list):
     """Fail fast (before hours of downloading) when a later stage is run without earlier outputs."""
-    if "pretrain" in stage_list:
+    if "pretrain" in stage_list or "data" in stage_list:
         return
     hint = "include the 'pretrain' stage, or point work_dir / import_dir at a previous run's outputs"
     if not os.path.exists(cfg.tokenizer_prefix + ".model"):
@@ -42,6 +42,18 @@ def check_prerequisites(cfg: Config, stage_list):
         raise FileNotFoundError(f"SFT needs pretrained weights in {cfg.work_dir}: {hint}.")
     if "rag" in stage_list and base is None and first_existing([cfg.sft_final_path, cfg.sft_ckpt_path]) is None:
         raise FileNotFoundError(f"RAG needs a trained model in {cfg.work_dir}: {hint}.")
+
+
+def run_data(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
+    """Everything that needs no GPU: corpus + tokenizer (already done by prepare_tokenizer), token bins,
+    SFT download + packing. Run it in a free CPU session, then import its output for GPU sessions."""
+    if rt.master:
+        prepare_token_bins(cfg, tok)
+        harvest_sft_examples(cfg)
+        prepare_sft_data(cfg, tok)
+        print("[✓] Data stage done. In the GPU notebook add this run's output as input and use "
+              "Config(import_dir='/kaggle/input/<this-run>').")
+    barrier(rt)
 
 
 def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
@@ -72,11 +84,13 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     barrier(rt)
     check_prerequisites(cfg, stage_list)
     tok = prepare_tokenizer(cfg, rt)
-    if rt.master and "pretrain" in stage_list:
+    if rt.master and ("pretrain" in stage_list or "data" in stage_list):
         harvest_khmer_corpus(cfg)   # pretraining needs the corpus even when the tokenizer came from elsewhere
     barrier(rt)
 
     results = dict(config=cfg, tokenizer=tok)
+    if "data" in stage_list:
+        run_data(cfg, rt, tok)
     if "pretrain" in stage_list:
         run_pretrain(cfg, rt, tok)
     if "sft" in stage_list:

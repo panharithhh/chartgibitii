@@ -117,13 +117,20 @@ def time_left(cfg: Config) -> bool:
 
 
 def link_previous_outputs(cfg: Config):
-    """Links files from a previous Kaggle run (added as notebook input) into work_dir."""
-    if not cfg.import_dir or not os.path.isdir(cfg.import_dir):
+    """Links files from previous Kaggle runs (added as notebook inputs) into work_dir.
+    import_dir may list several folders, comma-separated, newest first (first one wins per file),
+    e.g. "/kaggle/input/gpu-run-1,/kaggle/input/data-run"."""
+    if not cfg.import_dir:
         return
-    for name in sorted(os.listdir(cfg.import_dir)):
-        src, dst = os.path.join(cfg.import_dir, name), cfg.path(name)
-        if name.endswith(".tmp"):   # half-written leftovers of a killed session
+    os.makedirs(cfg.work_dir, exist_ok=True)
+    for folder in [d.strip() for d in cfg.import_dir.split(",") if d.strip()]:
+        if not os.path.isdir(folder):
+            print(f"[!] import_dir {folder} not found; skipped.")
             continue
-        if os.path.isfile(src) and not os.path.lexists(dst):
-            os.symlink(os.path.abspath(src), dst)
-            print(f"[↪] linked {name} from {cfg.import_dir}")
+        for name in sorted(os.listdir(folder)):
+            src, dst = os.path.join(folder, name), cfg.path(name)
+            if name.endswith(".tmp"):   # half-written leftovers of a killed session
+                continue
+            if os.path.isfile(src) and not os.path.lexists(dst):
+                os.symlink(os.path.abspath(src), dst)
+                print(f"[↪] linked {name} from {folder}")
