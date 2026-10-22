@@ -12,7 +12,9 @@ Settings go in the LAST line of this file, e.g.
   - free CPU session first: Config(stages="data") downloads the corpus, trains the tokenizer, builds token files
   - GPU sessions:     Config(import_dir="/kaggle/input/<newest-output>,/kaggle/input/<data-output>") resumes
   - ask afterwards:   RESULTS["rag"].ask("តើរាជធានីនៃប្រទេសកម្ពុជាគឺជាអ្វី?")
-  - 2x T4:            save as a file, then  !torchrun --nproc_per_node=2 train_khmer_llm.py
+  - or without editing this file: env KHMER_SET="key=value;key=value", e.g.
+        !KHMER_SET="stages=data;sft_custom_jsonl=/kaggle/input/x/shop_replies.jsonl" python train_khmer_llm.py
+  - 2x T4:            !KHMER_SET="..." torchrun --nproc_per_node=2 train_khmer_llm.py
 """
 import subprocess
 import sys
@@ -2726,6 +2728,8 @@ def run_data(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
 
 def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     cfg = cfg or Config()
+    # KHMER_SET="key=value;key=value" overrides settings without editing code (e.g. for torchrun on Kaggle)
+    apply_overrides(cfg, [kv for kv in os.environ.get("KHMER_SET", "").split(";") if kv.strip()])
     requested = stages or os.environ.get("KHMER_STAGES") or cfg.stages
     stage_list = [s.strip().lower() for s in requested.split(",") if s.strip()]
     unknown = set(stage_list) - set(STAGES)

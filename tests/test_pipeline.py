@@ -130,3 +130,9 @@ def test_kaggle_bundle_is_fresh_and_runs(tmp_path):
     out = subprocess.run([sys.executable, "-I", str(ROOT / "kaggle" / "train_khmer_llm.py")], cwd=tmp_path,
                          capture_output=True, text=True, timeout=600, env=env)
     assert out.returncode == 0 and "Self-test passed" in out.stdout, out.stderr[-2000:]
+
+
+def test_khmer_set_env_overrides_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHMER_SET", f"work_dir={tmp_path};stages=rag;run_self_test=false")
+    with pytest.raises(FileNotFoundError, match="No tokenizer"):   # rag-only on an empty dir fails fast
+        main(Config())

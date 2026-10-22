@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from .config import Config
+from .config import Config, apply_overrides
 from .data.corpus import harvest_khmer_corpus, prepare_token_bins
 from .data.tokenizer import KhmerTokenizer
 from .runtime import RUNTIME_FLAGS, Runtime, barrier, link_previous_outputs, setup_runtime
@@ -58,6 +58,8 @@ def run_data(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
 
 def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     cfg = cfg or Config()
+    # KHMER_SET="key=value;key=value" overrides settings without editing code (e.g. for torchrun on Kaggle)
+    apply_overrides(cfg, [kv for kv in os.environ.get("KHMER_SET", "").split(";") if kv.strip()])
     requested = stages or os.environ.get("KHMER_STAGES") or cfg.stages
     stage_list = [s.strip().lower() for s in requested.split(",") if s.strip()]
     unknown = set(stage_list) - set(STAGES)

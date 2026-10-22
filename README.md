@@ -50,6 +50,15 @@ tests/                     pytest suite (runs offline on CPU)
    ```
    `launch_ui=True` prints a public web link for customers.
 
+#### No-paste setup (recommended)
+Upload `kaggle/train_khmer_llm.py` into the same Kaggle dataset as your `shop_replies.jsonl`. Then in a notebook:
+```python
+!cp /kaggle/input/<your-dataset>/train_khmer_llm.py train.py
+!KHMER_SET="stages=data;sft_custom_jsonl=/kaggle/input/<your-dataset>/shop_replies.jsonl" python train.py
+```
+`KHMER_SET` sets any `Config` field (`key=value;key=value`) without editing the file. Use
+`torchrun --nproc_per_node=2 train.py` instead of `python train.py` to train on both T4s.
+
 #### Plan for the free tier (12 h sessions, ~30 GPU h per week)
 | Session | Hardware | Last line |
 |---|---|---|
