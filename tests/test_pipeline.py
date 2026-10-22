@@ -69,6 +69,9 @@ def test_full_pipeline_offline(tmp_path, capsys):
     for path in [cfg.tokenizer_prefix + ".model", cfg.train_bin, cfg.val_bin, cfg.sft_packed_path]:
         assert os.path.exists(path), path
     assert not os.path.exists(cfg.ckpt_path)
+    os.remove(cfg.corpus_path)   # the raw corpus is not needed once the token bins exist (smaller Kaggle output)
+    from khmer_llm.stages.rag import rag_fallback_path
+    assert rag_fallback_path(cfg) == cfg.tokenizer_sample_path
 
     results = main(cfg, stages="pretrain,sft,rag")
     for path in [cfg.final_path, cfg.sft_final_path, cfg.rag_index_path, cfg.sft_packed_path]:

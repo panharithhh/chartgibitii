@@ -26,6 +26,11 @@ RAG_DEMO_QUESTIONS = [
 ]
 
 
+def rag_fallback_path(cfg: Config) -> Optional[str]:
+    """Knowledge base when no rag_docs_dir: the corpus, or the tokenizer sample if the corpus was deleted."""
+    return first_existing([cfg.corpus_path, cfg.tokenizer_sample_path])
+
+
 def load_rag_documents(cfg: Config) -> List[Tuple[str, str]]:
     """(source, text) pairs from rag_docs_dir (.txt/.md/.jsonl), else consecutive corpus lines."""
     docs = []
@@ -56,7 +61,7 @@ def load_rag_documents(cfg: Config) -> List[Tuple[str, str]]:
         if cfg.rag_docs_dir:
             print(f"[!] rag_docs_dir {cfg.rag_docs_dir} not found; using the harvested corpus instead.")
         group, start = [], 0
-        with open_text(cfg.corpus_path) as f:
+        with open_text(rag_fallback_path(cfg)) as f:
             for i, line in enumerate(f):
                 if i >= cfg.rag_max_corpus_lines:
                     break
@@ -188,7 +193,7 @@ def rrf_fuse(ranked_lists: List[List[int]], top_k: int, k: int = 60) -> List[int
 
 
 def _rag_fingerprint(cfg: Config, tok: KhmerTokenizer) -> dict:
-    src = cfg.rag_docs_dir if cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir) else cfg.corpus_path
+    src = cfg.rag_docs_dir if cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir) else (rag_fallback_path(cfg) or "")
     if os.path.isdir(src):
         stats = [os.stat(os.path.join(r, f)) for r, _, fs in os.walk(src) for f in fs]
         mtime, size = max((s.st_mtime for s in stats), default=0), sum(s.st_size for s in stats)

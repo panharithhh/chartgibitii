@@ -856,14 +856,22 @@ def _flatten_with_eos(seqs: List[List[int]], eos_id: int) -> np.ndarray:
     return np.insert(flat, np.cumsum(lengths), eos_id)
 
 
+def token_bins_ready(cfg: Config, tok: KhmerTokenizer) -> bool:
+    """True when train/val bins exist and were built with this tokenizer (then the raw corpus is not needed)."""
+    meta_path = cfg.train_bin + ".json"
+    if not (os.path.exists(cfg.train_bin) and os.path.exists(cfg.val_bin) and os.path.exists(meta_path)):
+        return False
+    with open(meta_path) as f:
+        meta = json.load(f)
+    return meta.get("tokenizer") in (None, tok.fingerprint)   # None: bins from before fingerprints existed
+
+
 def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
     meta_path = cfg.train_bin + ".json"
-    if os.path.exists(cfg.train_bin) and os.path.exists(cfg.val_bin) and os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        if meta.get("tokenizer") in (None, tok.fingerprint):   # None: bins from before fingerprints existed
-            print(f"[✓] Token bins found: {meta}")
-            return
+    if token_bins_ready(cfg, tok):
+        print(f"[✓] Token bins found: {json.load(open(meta_path))}")
+        return
+    if os.path.exists(meta_path):
         print("[!] Token bins were built with a different tokenizer; rebuilding.")
     assert tok.vocab_size < 2**16, "uint16 bins need vocab < 65536"
     print("\n[🔄] Tokenizing corpus -> uint16 memmap bins...")
@@ -2094,6 +2102,11 @@ RAG_DEMO_QUESTIONS = [
 ]
 
 
+def rag_fallback_path(cfg: Config) -> Optional[str]:
+    """Knowledge base when no rag_docs_dir: the corpus, or the tokenizer sample if the corpus was deleted."""
+    return first_existing([cfg.corpus_path, cfg.tokenizer_sample_path])
+
+
 def load_rag_documents(cfg: Config) -> List[Tuple[str, str]]:
     """(source, text) pairs from rag_docs_dir (.txt/.md/.jsonl), else consecutive corpus lines."""
     docs = []
@@ -2124,7 +2137,7 @@ def load_rag_documents(cfg: Config) -> List[Tuple[str, str]]:
         if cfg.rag_docs_dir:
             print(f"[!] rag_docs_dir {cfg.rag_docs_dir} not found; using the harvested corpus instead.")
         group, start = [], 0
-        with open_text(cfg.corpus_path) as f:
+        with open_text(rag_fallback_path(cfg)) as f:
             for i, line in enumerate(f):
                 if i >= cfg.rag_max_corpus_lines:
                     break
@@ -2256,7 +2269,7 @@ def rrf_fuse(ranked_lists: List[List[int]], top_k: int, k: int = 60) -> List[int
 
 
 def _rag_fingerprint(cfg: Config, tok: KhmerTokenizer) -> dict:
-    src = cfg.rag_docs_dir if cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir) else cfg.corpus_path
+    src = cfg.rag_docs_dir if cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir) else (rag_fallback_path(cfg) or "")
     if os.path.isdir(src):
         stats = [os.stat(os.path.join(r, f)) for r, _, fs in os.walk(src) for f in fs]
         mtime, size = max((s.st_mtime for s in stats), default=0), sum(s.st_size for s in stats)
@@ -2756,8 +2769,8 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     barrier(rt)
     check_prerequisites(cfg, stage_list)
     tok = prepare_tokenizer(cfg, rt)
-    if rt.master and ("pretrain" in stage_list or "data" in stage_list):
-        harvest_khmer_corpus(cfg)   # pretraining needs the corpus even when the tokenizer came from elsewhere
+    if rt.master and ("pretrain" in stage_list or "data" in stage_list) and not token_bins_ready(cfg, tok):
+        harvest_khmer_corpus(cfg)   # the raw corpus is only needed to (re)build the token bins
     barrier(rt)
 
     results = dict(config=cfg, tokenizer=tok)
@@ -2770,7 +2783,7 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     if rt.ddp:
         dist.destroy_process_group()
     if "rag" in stage_list and rt.master:
-        if not os.path.exists(cfg.corpus_path) and not (cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir)):
+        if not rag_fallback_path(cfg) and not (cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir)):
             harvest_khmer_corpus(cfg)   # default knowledge base = harvested corpus
         results["rag"] = run_rag(cfg, rt, tok)
         if cfg.launch_ui:

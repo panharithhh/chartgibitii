@@ -7,12 +7,12 @@ import torch
 import torch.distributed as dist
 
 from .config import Config, apply_overrides
-from .data.corpus import harvest_khmer_corpus, prepare_token_bins
+from .data.corpus import harvest_khmer_corpus, prepare_token_bins, token_bins_ready
 from .data.tokenizer import KhmerTokenizer
 from .runtime import RUNTIME_FLAGS, Runtime, barrier, link_previous_outputs, setup_runtime
 from .selftest import self_test
 from .stages.pretrain import run_pretrain
-from .stages.rag import run_rag
+from .stages.rag import rag_fallback_path, run_rag
 from .stages.sft import harvest_sft_examples, prepare_sft_data, run_sft
 from .train.checkpoint import first_existing
 
@@ -86,8 +86,8 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     barrier(rt)
     check_prerequisites(cfg, stage_list)
     tok = prepare_tokenizer(cfg, rt)
-    if rt.master and ("pretrain" in stage_list or "data" in stage_list):
-        harvest_khmer_corpus(cfg)   # pretraining needs the corpus even when the tokenizer came from elsewhere
+    if rt.master and ("pretrain" in stage_list or "data" in stage_list) and not token_bins_ready(cfg, tok):
+        harvest_khmer_corpus(cfg)   # the raw corpus is only needed to (re)build the token bins
     barrier(rt)
 
     results = dict(config=cfg, tokenizer=tok)
@@ -100,7 +100,7 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     if rt.ddp:
         dist.destroy_process_group()
     if "rag" in stage_list and rt.master:
-        if not os.path.exists(cfg.corpus_path) and not (cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir)):
+        if not rag_fallback_path(cfg) and not (cfg.rag_docs_dir and os.path.isdir(cfg.rag_docs_dir)):
             harvest_khmer_corpus(cfg)   # default knowledge base = harvested corpus
         results["rag"] = run_rag(cfg, rt, tok)
         if cfg.launch_ui:
