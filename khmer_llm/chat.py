@@ -10,6 +10,12 @@ from .runtime import Runtime, autocast_ctx
 from .text import clean_multiline
 
 SFT_SYSTEM_PROMPT = ""   # optional Khmer system prompt prepended to every example
+STANCES = ("ok", "neutral", "no")   # reply styles of the shop-reply data: yes / let me check / no
+
+
+def system_text(stance: Optional[str] = None) -> str:
+    """System slot = global system prompt + optional reply-style tag, e.g. "reply: ok"."""
+    return " ".join(p for p in (SFT_SYSTEM_PROMPT, f"reply: {stance}" if stance else "") if p)
 
 
 def neutralize_markers(text: str) -> str:
@@ -55,18 +61,22 @@ def generate(model, tok, prompt: str, rt: Runtime, max_new_tokens: int = 80,
 
 
 def chat(model, tok, question: str, rt: Runtime, context: str = "", max_new_tokens: int = 200,
-         temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1) -> str:
-    """Answers a Khmer question with the chat template (optionally grounded on `context`)."""
+         temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1,
+         stance: Optional[str] = None) -> str:
+    """Answers a Khmer question with the chat template (optionally grounded on `context`).
+    stance: reply style learned from shop-reply data ("ok" / "neutral" / "no"); None = plain answer."""
     question, context = clean_multiline(question), clean_multiline(context)
+    system = system_text(stance)
     L = model.cfg.context_length
     budget = L - max_new_tokens - 1
-    built = build_chat_example(tok, question, None, context, max_len=budget, system=SFT_SYSTEM_PROMPT)
+    built = build_chat_example(tok, question, None, context, max_len=budget, system=system)
     if built is not None:
         prompt = [tok.eos_id] + built[0]
     else:   # question alone is longer than the window: keep its end
+        head = (tok.marker("<|system|>") + tok.encode(system)) if system else []
         user, asst = tok.marker("<|user|>"), tok.marker("<|assistant|>")
-        keep = budget - len(user) - len(asst)
-        prompt = [tok.eos_id] + user + tok.encode(neutralize_markers(question))[-keep:] + asst
+        keep = budget - len(head) - len(user) - len(asst)
+        prompt = [tok.eos_id] + head + user + tok.encode(neutralize_markers(question))[-keep:] + asst
     idx = torch.tensor([prompt], dtype=torch.long, device=rt.device)
     out = model.generate(idx, max_new_tokens, temperature, top_k, top_p, eos_id=tok.eos_id,
                          amp=autocast_ctx(rt), repetition_penalty=repetition_penalty)

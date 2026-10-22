@@ -135,3 +135,29 @@ def test_iter_json_file_reads_gz_arrays_and_jsonl(tmp_path):
     lines = tmp_path / "rows.jsonl"
     lines.write_text('{"a": 1}\n\n{"a": 2}\n', encoding="utf-8")
     assert len(list(iter_json_file(str(arr)))) == 2 and [r["a"] for r in iter_json_file(str(lines))] == [1, 2]
+
+
+def test_shop_reply_format_expands_to_one_example_per_style(tmp_path):
+    from khmer_llm.chat import system_text
+    rows = read_custom_examples("examples/shop_replies.jsonl")
+    assert len(rows) == 12 * 3 and {r["stance"] for r in rows} == {"ok", "neutral", "no"}
+    first = [r for r in rows if r["instruction"] == "បង ពណ៌ខ្មៅនៅមានទេ?"]
+    assert {r["stance"]: r["response"] for r in first}["no"] == "សុំទោសបង ពណ៌ខ្មៅអស់ហើយចាស។"
+    assert all(r["context"] == "" for r in rows)   # "input" is the customer message, not context
+    assert system_text("ok") == "reply: ok" and system_text(None) == ""
+    p = tmp_path / "plain.jsonl"
+    p.write_text(json.dumps({"input": "q?", "output": "a."}) + "\n" +
+                 json.dumps({"instruction": "do x", "input": "some text", "output": "done"}) + "\n", encoding="utf-8")
+    plain = read_custom_examples(str(p))
+    assert plain[0] == dict(instruction="q?", context="", response="a.")
+    assert plain[1] == dict(instruction="do x", context="some text", response="done")
+
+
+def test_stance_goes_into_the_system_slot(cfg, rt):
+    from khmer_llm.chat import build_chat_example, chat, system_text
+    from khmer_llm.model.lm import KimiMoELM
+    tok = ToyTokenizer(cfg.vocab_size)
+    ids, mask = build_chat_example(tok, "q", "a", system=system_text("no"))
+    assert ids[0] == tok.marker("<|system|>")[0] and ids[1:1 + len("reply: no")] == tok.encode("reply: no")
+    model = KimiMoELM(cfg).to(rt.device)
+    assert isinstance(chat(model, tok, "q" * 500, rt, max_new_tokens=8, stance="neutral"), str)

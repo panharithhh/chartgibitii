@@ -28,6 +28,8 @@ def main(argv: Optional[List[str]] = None):
             p.add_argument("--stages", help="comma list of pretrain,sft,rag (default: Config.stages)")
         if name == "ask":
             p.add_argument("question", nargs="*", help="question; omit for an interactive prompt")
+            p.add_argument("--stance", help="one reply style: ok / neutral / no")
+            p.add_argument("--replies", action="store_true", help="show one reply per style (ok, neutral, no)")
         if name == "ui":
             p.add_argument("--no-share", action="store_true", help="local URL only, no public link")
     args = parser.parse_args(argv)
@@ -39,15 +41,16 @@ def main(argv: Optional[List[str]] = None):
     elif args.cmd == "ask":
         from .stages.rag import KhmerRAG
         rag = KhmerRAG.load(cfg)
+        answer = (lambda q: rag.suggest_replies(q)) if args.replies else (lambda q: rag.ask(q, stance=args.stance))
         if args.question:
-            rag.ask(" ".join(args.question))
+            answer(" ".join(args.question))
         else:
             print("Type a Khmer question (empty line to quit).")
             while True:
                 q = input("❓ ").strip()
                 if not q:
                     break
-                rag.ask(q)
+                answer(q)
     elif args.cmd == "ui":
         from .stages.rag import KhmerRAG
         from .ui import launch_ui

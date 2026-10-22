@@ -1539,6 +1539,12 @@ import torch
 
 
 SFT_SYSTEM_PROMPT = ""   # optional Khmer system prompt prepended to every example
+STANCES = ("ok", "neutral", "no")   # reply styles of the shop-reply data: yes / let me check / no
+
+
+def system_text(stance: Optional[str] = None) -> str:
+    """System slot = global system prompt + optional reply-style tag, e.g. "reply: ok"."""
+    return " ".join(p for p in (SFT_SYSTEM_PROMPT, f"reply: {stance}" if stance else "") if p)
 
 
 def neutralize_markers(text: str) -> str:
@@ -1584,18 +1590,22 @@ def generate(model, tok, prompt: str, rt: Runtime, max_new_tokens: int = 80,
 
 
 def chat(model, tok, question: str, rt: Runtime, context: str = "", max_new_tokens: int = 200,
-         temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1) -> str:
-    """Answers a Khmer question with the chat template (optionally grounded on `context`)."""
+         temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1,
+         stance: Optional[str] = None) -> str:
+    """Answers a Khmer question with the chat template (optionally grounded on `context`).
+    stance: reply style learned from shop-reply data ("ok" / "neutral" / "no"); None = plain answer."""
     question, context = clean_multiline(question), clean_multiline(context)
+    system = system_text(stance)
     L = model.cfg.context_length
     budget = L - max_new_tokens - 1
-    built = build_chat_example(tok, question, None, context, max_len=budget, system=SFT_SYSTEM_PROMPT)
+    built = build_chat_example(tok, question, None, context, max_len=budget, system=system)
     if built is not None:
         prompt = [tok.eos_id] + built[0]
     else:   # question alone is longer than the window: keep its end
+        head = (tok.marker("<|system|>") + tok.encode(system)) if system else []
         user, asst = tok.marker("<|user|>"), tok.marker("<|assistant|>")
-        keep = budget - len(user) - len(asst)
-        prompt = [tok.eos_id] + user + tok.encode(neutralize_markers(question))[-keep:] + asst
+        keep = budget - len(head) - len(user) - len(asst)
+        prompt = [tok.eos_id] + head + user + tok.encode(neutralize_markers(question))[-keep:] + asst
     idx = torch.tensor([prompt], dtype=torch.long, device=rt.device)
     out = model.generate(idx, max_new_tokens, temperature, top_k, top_p, eos_id=tok.eos_id,
                          amp=autocast_ctx(rt), repetition_penalty=repetition_penalty)
@@ -1798,18 +1808,27 @@ def harvest_sft_examples(cfg: Config) -> str:
 
 
 def read_custom_examples(path: str) -> List[dict]:
-    """Your own Q&A, one JSON object per line: instruction/question, response/answer/output, context/input."""
+    """
+    Your own Q&A, one JSON object per line. Accepted shapes:
+      {"question" | "instruction": ..., "answer" | "response" | "output": ..., "context" | "input": ...}
+      {"input": <customer message>, "output": <reply>}                       (input = the question)
+      {"input": ..., "output": {"ok": ..., "neutral": ..., "no": ...}}       (one example per reply style)
+    """
     out = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             row = json.loads(line)
-            ex = _make_example(row.get("instruction") or row.get("question"),
-                               row.get("response") or row.get("answer") or row.get("output"),
-                               row.get("context") or row.get("input") or "")
-            if ex is not None:
-                out.append(ex)
+            explicit_q = row.get("instruction") or row.get("question")
+            question = explicit_q or row.get("input")
+            context = row.get("context") or (row.get("input") if explicit_q else "") or ""
+            answer = row.get("response") or row.get("answer") or row.get("output")
+            replies = answer.items() if isinstance(answer, dict) else [(None, answer)]
+            for stance, reply in replies:
+                ex = _make_example(question, reply, context)
+                if ex is not None:
+                    out.append({**ex, "stance": str(stance)} if stance is not None else ex)
     return out
 
 
@@ -1855,7 +1874,7 @@ def prepare_sft_data(cfg: Config, tok: KhmerTokenizer):
     def build(ex):
         nonlocal dropped
         built = build_chat_example(tok, ex["instruction"], ex["response"], ex.get("context", ""),
-                                   max_len=cfg.context_length, system=SFT_SYSTEM_PROMPT)
+                                   max_len=cfg.context_length, system=system_text(ex.get("stance")))
         dropped += built is None
         return built
 
@@ -2262,9 +2281,10 @@ class KhmerRAG:
             ranked.append(torch.topk(sims.float(), min(n_cand, len(sims))).indices.tolist())
         return rrf_fuse(ranked, k)
 
-    def build_context(self, question: str, hits: List[int], max_new_tokens: int) -> Tuple[str, List[int]]:
+    def build_context(self, question: str, hits: List[int], max_new_tokens: int,
+                      system: str = "") -> Tuple[str, List[int]]:
         """Numbered passages cut to fit the window with the question and answer; also returns the hits used."""
-        q_len = len(build_chat_example(self.tok, question, None, "")[0])
+        q_len = len(build_chat_example(self.tok, question, None, "", system=system)[0])
         budget = min(self.cfg.rag_max_context_tokens, self.model.cfg.context_length - max_new_tokens - q_len - 8)
         parts, used_hits, used = [], [], 0
         for n, i in enumerate(hits, 1):
@@ -2281,19 +2301,31 @@ class KhmerRAG:
         return "\n".join(parts), used_hits
 
     def ask(self, question: str, top_k: Optional[int] = None, max_new_tokens: Optional[int] = None,
-            temperature: float = 0.3, verbose: bool = True) -> dict:
+            temperature: float = 0.3, verbose: bool = True, stance: Optional[str] = None) -> dict:
+        """One answer. stance="ok" / "neutral" / "no" picks a reply style learned from shop-reply data."""
+        return self.suggest_replies(question, stances=(stance,), top_k=top_k, max_new_tokens=max_new_tokens,
+                                    temperature=temperature, verbose=verbose, _single=True)
+
+    def suggest_replies(self, question: str, stances=STANCES, top_k: Optional[int] = None,
+                        max_new_tokens: Optional[int] = None, temperature: float = 0.3, verbose: bool = True,
+                        _single: bool = False) -> dict:
+        """One reply per style for the same question and retrieved passages, e.g. for a seller to pick from."""
         question = clean_multiline(question)
         max_new = max_new_tokens or self.cfg.rag_max_new_tokens
         hits = self.retrieve(question, top_k)
-        context, used_hits = self.build_context(question, hits, max_new)
-        answer = chat(self.model, self.tok, question, self.rt, context=context, max_new_tokens=max_new,
-                      temperature=temperature, top_p=0.9)
-        result = dict(question=question, answer=answer,
-                      sources=[dict(source=self.sources[i], passage=self.chunks[i]) for i in used_hits])
+        longest = max((system_text(s) for s in stances), key=len)
+        context, used_hits = self.build_context(question, hits, max_new, system=longest)
+        replies = {s: chat(self.model, self.tok, question, self.rt, context=context, max_new_tokens=max_new,
+                           temperature=temperature, top_p=0.9, stance=s) for s in stances}
+        sources = [dict(source=self.sources[i], passage=self.chunks[i]) for i in used_hits]
+        result = dict(question=question, sources=sources,
+                      **(dict(answer=next(iter(replies.values()))) if _single else dict(replies=replies)))
         if verbose:
-            print(f"\n❓ {question}\n💬 {answer}")
-            for n, s in enumerate(result["sources"], 1):
-                print(f"   [{n}] {s['source']}: {s['passage'][:120]}...")
+            print(f"\n❓ {question}")
+            for s, reply in replies.items():
+                print(f"💬 {'' if s is None else f'[{s}] '}{reply}")
+            for n, src in enumerate(sources, 1):
+                print(f"   [{n}] {src['source']}: {src['passage'][:120]}...")
         return result
 
 
@@ -2338,7 +2370,9 @@ def run_rag(cfg: Config, rt: Runtime, tok: KhmerTokenizer) -> KhmerRAG:
 # ======================================================================================
 # khmer_llm/ui.py
 # ======================================================================================
-"""Minimal customer-facing web page: Khmer question in, answer + sources out (Gradio)."""
+"""Minimal web page: Khmer customer message in, suggested replies (or one answer) + sources out (Gradio)."""
+
+STANCE_LABELS = {"ok": "✅ ok (បាន)", "neutral": "⏳ neutral (ចាំមើលសិន)", "no": "❌ no (មិនបាន)"}
 
 
 def launch_ui(rag: KhmerRAG, share: bool = True):
@@ -2346,21 +2380,32 @@ def launch_ui(rag: KhmerRAG, share: bool = True):
     ensure_package("gradio")
     import gradio as gr
 
-    def answer(question):
-        if not question or not question.strip():
-            return "", ""
-        r = rag.ask(question.strip(), verbose=False)
+    def respond(message, mode):
+        if not message or not message.strip():
+            return [""] * (len(STANCES) + 2)
+        if mode == "plain":
+            r = rag.ask(message.strip(), verbose=False)
+            replies = [""] * len(STANCES)
+            plain = r["answer"]
+        else:
+            r = rag.suggest_replies(message.strip(), verbose=False)
+            replies = [r["replies"][s] for s in STANCES]
+            plain = ""
         srcs = "\n\n".join(f"[{n}] {s['source']}\n{s['passage'][:300]}" for n, s in enumerate(r["sources"], 1))
-        return r["answer"], srcs
+        return [*replies, plain, srcs]
 
     with gr.Blocks(title="Khmer Q&A") as demo:
-        gr.Markdown("## សួរសំណួរជាភាសាខ្មែរ · Ask a question in Khmer")
-        q = gr.Textbox(label="សំណួរ (Question)", lines=2)
-        btn = gr.Button("សួរ (Ask)")
-        a = gr.Textbox(label="ចម្លើយ (Answer)", lines=6)
-        s = gr.Textbox(label="ប្រភព (Sources)", lines=8)
-        btn.click(answer, q, [a, s])
-        q.submit(answer, q, [a, s])
+        gr.Markdown("## សារអតិថិជន · Customer message (Khmer)")
+        msg = gr.Textbox(label="សារ (Message)", lines=2)
+        mode = gr.Radio(["3 replies", "plain"], value="3 replies", label="Mode")
+        btn = gr.Button("ឆ្លើយ (Reply)")
+        with gr.Row():
+            reply_boxes = [gr.Textbox(label=STANCE_LABELS.get(s, s), lines=3) for s in STANCES]
+        plain = gr.Textbox(label="ចម្លើយ (Answer)", lines=4)
+        srcs = gr.Textbox(label="ប្រភព (Sources)", lines=6)
+        outputs = [*reply_boxes, plain, srcs]
+        btn.click(respond, [msg, mode], outputs)
+        msg.submit(respond, [msg, mode], outputs)
     demo.launch(share=share)
 
 

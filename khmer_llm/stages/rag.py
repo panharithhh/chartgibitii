@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..chat import build_chat_example, chat
+from ..chat import STANCES, build_chat_example, chat, system_text
 from ..config import Config, with_architecture_of
 from ..data.corpus import open_text
 from ..data.tokenizer import KhmerTokenizer
@@ -277,9 +277,10 @@ class KhmerRAG:
             ranked.append(torch.topk(sims.float(), min(n_cand, len(sims))).indices.tolist())
         return rrf_fuse(ranked, k)
 
-    def build_context(self, question: str, hits: List[int], max_new_tokens: int) -> Tuple[str, List[int]]:
+    def build_context(self, question: str, hits: List[int], max_new_tokens: int,
+                      system: str = "") -> Tuple[str, List[int]]:
         """Numbered passages cut to fit the window with the question and answer; also returns the hits used."""
-        q_len = len(build_chat_example(self.tok, question, None, "")[0])
+        q_len = len(build_chat_example(self.tok, question, None, "", system=system)[0])
         budget = min(self.cfg.rag_max_context_tokens, self.model.cfg.context_length - max_new_tokens - q_len - 8)
         parts, used_hits, used = [], [], 0
         for n, i in enumerate(hits, 1):
@@ -296,19 +297,31 @@ class KhmerRAG:
         return "\n".join(parts), used_hits
 
     def ask(self, question: str, top_k: Optional[int] = None, max_new_tokens: Optional[int] = None,
-            temperature: float = 0.3, verbose: bool = True) -> dict:
+            temperature: float = 0.3, verbose: bool = True, stance: Optional[str] = None) -> dict:
+        """One answer. stance="ok" / "neutral" / "no" picks a reply style learned from shop-reply data."""
+        return self.suggest_replies(question, stances=(stance,), top_k=top_k, max_new_tokens=max_new_tokens,
+                                    temperature=temperature, verbose=verbose, _single=True)
+
+    def suggest_replies(self, question: str, stances=STANCES, top_k: Optional[int] = None,
+                        max_new_tokens: Optional[int] = None, temperature: float = 0.3, verbose: bool = True,
+                        _single: bool = False) -> dict:
+        """One reply per style for the same question and retrieved passages, e.g. for a seller to pick from."""
         question = clean_multiline(question)
         max_new = max_new_tokens or self.cfg.rag_max_new_tokens
         hits = self.retrieve(question, top_k)
-        context, used_hits = self.build_context(question, hits, max_new)
-        answer = chat(self.model, self.tok, question, self.rt, context=context, max_new_tokens=max_new,
-                      temperature=temperature, top_p=0.9)
-        result = dict(question=question, answer=answer,
-                      sources=[dict(source=self.sources[i], passage=self.chunks[i]) for i in used_hits])
+        longest = max((system_text(s) for s in stances), key=len)
+        context, used_hits = self.build_context(question, hits, max_new, system=longest)
+        replies = {s: chat(self.model, self.tok, question, self.rt, context=context, max_new_tokens=max_new,
+                           temperature=temperature, top_p=0.9, stance=s) for s in stances}
+        sources = [dict(source=self.sources[i], passage=self.chunks[i]) for i in used_hits]
+        result = dict(question=question, sources=sources,
+                      **(dict(answer=next(iter(replies.values()))) if _single else dict(replies=replies)))
         if verbose:
-            print(f"\n❓ {question}\n💬 {answer}")
-            for n, s in enumerate(result["sources"], 1):
-                print(f"   [{n}] {s['source']}: {s['passage'][:120]}...")
+            print(f"\n❓ {question}")
+            for s, reply in replies.items():
+                print(f"💬 {'' if s is None else f'[{s}] '}{reply}")
+            for n, src in enumerate(sources, 1):
+                print(f"   [{n}] {src['source']}: {src['passage'][:120]}...")
         return result
 
 

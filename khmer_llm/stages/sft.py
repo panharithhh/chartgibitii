@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from ..chat import SFT_SYSTEM_PROMPT, build_chat_example, chat
+from ..chat import SFT_SYSTEM_PROMPT, build_chat_example, chat, system_text
 from ..config import Config
 from ..data.hf import maybe_hf_login, open_hf_stream
 from ..data.sources import SFT_SOURCES
@@ -142,18 +142,27 @@ def harvest_sft_examples(cfg: Config) -> str:
 
 
 def read_custom_examples(path: str) -> List[dict]:
-    """Your own Q&A, one JSON object per line: instruction/question, response/answer/output, context/input."""
+    """
+    Your own Q&A, one JSON object per line. Accepted shapes:
+      {"question" | "instruction": ..., "answer" | "response" | "output": ..., "context" | "input": ...}
+      {"input": <customer message>, "output": <reply>}                       (input = the question)
+      {"input": ..., "output": {"ok": ..., "neutral": ..., "no": ...}}       (one example per reply style)
+    """
     out = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             row = json.loads(line)
-            ex = _make_example(row.get("instruction") or row.get("question"),
-                               row.get("response") or row.get("answer") or row.get("output"),
-                               row.get("context") or row.get("input") or "")
-            if ex is not None:
-                out.append(ex)
+            explicit_q = row.get("instruction") or row.get("question")
+            question = explicit_q or row.get("input")
+            context = row.get("context") or (row.get("input") if explicit_q else "") or ""
+            answer = row.get("response") or row.get("answer") or row.get("output")
+            replies = answer.items() if isinstance(answer, dict) else [(None, answer)]
+            for stance, reply in replies:
+                ex = _make_example(question, reply, context)
+                if ex is not None:
+                    out.append({**ex, "stance": str(stance)} if stance is not None else ex)
     return out
 
 
@@ -199,7 +208,7 @@ def prepare_sft_data(cfg: Config, tok: KhmerTokenizer):
     def build(ex):
         nonlocal dropped
         built = build_chat_example(tok, ex["instruction"], ex["response"], ex.get("context", ""),
-                                   max_len=cfg.context_length, system=SFT_SYSTEM_PROMPT)
+                                   max_len=cfg.context_length, system=system_text(ex.get("stance")))
         dropped += built is None
         return built
 

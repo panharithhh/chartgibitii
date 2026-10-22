@@ -73,6 +73,8 @@ def test_full_pipeline_offline(tmp_path, capsys):
     answer = rag.ask("តើអង្គរវត្តមានទីតាំងនៅខេត្តណា?", verbose=False)
     assert isinstance(answer["answer"], str) and answer["sources"]
     assert any(s["source"] == "angkor.txt" for s in answer["sources"][:2])
+    suggested = rag.suggest_replies("បង ពណ៌ខ្មៅនៅមានទេ?", verbose=False)
+    assert set(suggested["replies"]) == {"ok", "neutral", "no"} and all(isinstance(v, str) for v in suggested["replies"].values())
     # key word first in the question (SentencePiece gives it a '▁' piece) still hits the right doc
     assert rag.sources[rag.bm25.search(lexical_terms(rag.tok, "អង្គរវត្តនៅឯណា?"), 1)[0]] == "angkor.txt"
     # chat markers typed into a question or document never become real role tokens

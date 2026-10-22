@@ -72,6 +72,7 @@ To use 2 GPUs: `torchrun --nproc_per_node=2 -m khmer_llm run`.
 |---|---|
 | Documents to answer from (RAG) | Put `.txt`, `.md` or `.jsonl` (`{"title", "text", "source"}`) files in a folder and pass `--docs <folder>`. See `examples/docs/`. |
 | Your own Q&A pairs (SFT) | One JSON object per line with `question` and `answer`, plus an optional `context`. Pass `--set sft_custom_jsonl=<file>`. These are upsampled 3×. If you add or change them after a finished run, SFT restarts from the base model. See `examples/sft_custom.jsonl`. |
+| Shop replies in 3 styles (SFT) | `{"input": <customer message>, "output": {"ok": ..., "neutral": ..., "no": ...}}` per line, passed the same way (`sft_custom_jsonl`). Each line trains 3 examples tagged with their style. Afterwards: `rag.suggest_replies(msg)` gives all 3, `rag.ask(msg, stance="no")` gives one, `python -m khmer_llm ask --replies "..."` from the CLI, and the web page shows the 3 side by side. See `examples/shop_replies.jsonl`. |
 
 With no docs folder, RAG falls back to a slice of the harvested Khmer corpus.
 
