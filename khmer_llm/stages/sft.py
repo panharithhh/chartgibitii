@@ -275,7 +275,8 @@ def run_sft(cfg: Config, rt: Runtime, tok: KhmerTokenizer):
 
     raw_model = build_model(cfg, rt)
     if not (cfg.resume and os.path.exists(cfg.sft_ckpt_path)):
-        base = first_existing([cfg.pretrained_ckpt, cfg.final_path, cfg.ckpt_path])
+        # prefer the fp32 training checkpoint over the half-precision inference copy
+        base = first_existing([cfg.pretrained_ckpt, cfg.ckpt_path, cfg.final_path])
         if base is None:
             raise FileNotFoundError("SFT needs pretrained weights: run the 'pretrain' stage first, "
                                     "or set Config.pretrained_ckpt / Config.import_dir.")
