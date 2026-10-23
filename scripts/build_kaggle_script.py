@@ -16,12 +16,12 @@ OUT = ROOT / "kaggle" / "train_khmer_llm.py"
 # Dependency order: every module only uses names defined above it.
 MODULES = [
     "config.py", "runtime.py", "text.py",
-    "data/hf.py", "data/sources.py", "data/tokenizer.py", "data/corpus.py",
+    "data/hf.py", "data/sources.py", "data/tokenizer.py", "data/bpe.py", "data/corpus.py",
     "model/layers.py", "model/lm.py",
     "optim/muon.py", "optim/hybrid.py",
     "train/checkpoint.py", "train/loop.py",
     "chat.py", "stages/pretrain.py", "stages/sft.py", "stages/rag.py",
-    "ui.py", "selftest.py", "pipeline.py",
+    "ui.py", "selftest.py", "bench.py", "pipeline.py",
 ]
 
 HEADER = '''"""

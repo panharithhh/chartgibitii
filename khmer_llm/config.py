@@ -11,6 +11,13 @@ class Config:
     stages: str = "pretrain,sft,rag"   # env KHMER_STAGES overrides; "data" = download + tokenizer only (CPU)
     launch_ui: bool = False            # Gradio web page for customers at the end (public share link)
 
+    # ---- tokenizer ----
+    tokenizer_type: str = "unigram"    # "unigram" | "sp_bpe" (SentencePiece BPE) | "byte_bpe" (byte-level BPE, Khmer regex)
+
+    # ---- tokenizer benchmark (stage "bench") ----
+    bench_tokenizers: str = "unigram,sp_bpe,byte_bpe"   # each trained with the same model, data and steps
+    bench_steps: int = 2000
+
     # ---- model ----
     vocab_size: int = 16000            # 16000 or 32000
     context_length: int = 1024
@@ -106,16 +113,22 @@ class Config:
         return self.path("khmer_tokenizer_sample.txt.gz")
 
     @property
+    def _tok_tag(self) -> str:   # "" for unigram keeps the original file names
+        return "" if self.tokenizer_type == "unigram" else f"{self.tokenizer_type}_"
+
+    @property
     def tokenizer_prefix(self) -> str:
-        return self.path(f"khmer_sp_unigram_{self.vocab_size // 1000}k")
+        if self.tokenizer_type == "unigram":
+            return self.path(f"khmer_sp_unigram_{self.vocab_size // 1000}k")
+        return self.path(f"khmer_{self.tokenizer_type}_{self.vocab_size // 1000}k")
 
     @property
     def train_bin(self) -> str:
-        return self.path(f"train_{self.vocab_size}.bin")
+        return self.path(f"train_{self._tok_tag}{self.vocab_size}.bin")
 
     @property
     def val_bin(self) -> str:
-        return self.path(f"val_{self.vocab_size}.bin")
+        return self.path(f"val_{self._tok_tag}{self.vocab_size}.bin")
 
     @property
     def ckpt_path(self) -> str:
@@ -131,7 +144,7 @@ class Config:
 
     @property
     def sft_packed_path(self) -> str:
-        return self.path(f"sft_packed_{self.vocab_size}_{self.context_length}.npz")
+        return self.path(f"sft_packed_{self._tok_tag}{self.vocab_size}_{self.context_length}.npz")
 
     @property
     def sft_ckpt_path(self) -> str:
@@ -146,7 +159,7 @@ class Config:
         return self.path("khmer_rag_index.pt")
 
 
-ARCH_FIELDS = ("vocab_size", "context_length", "d_model", "n_layers", "n_heads", "n_kv_heads", "rope_theta",
+ARCH_FIELDS = ("tokenizer_type", "vocab_size", "context_length", "d_model", "n_layers", "n_heads", "n_kv_heads", "rope_theta",
                "norm_eps", "n_dense_layers", "n_shared_experts", "n_routed_experts", "top_k", "d_ff_shared",
                "d_ff_expert", "tie_embeddings")
 

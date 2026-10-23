@@ -25,7 +25,7 @@ def main(argv: Optional[List[str]] = None):
         p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                        help="override any Config field, e.g. --set max_iters=100")
         if name == "run":
-            p.add_argument("--stages", help="comma list of pretrain,sft,rag (default: Config.stages)")
+            p.add_argument("--stages", help="comma list of data,bench,pretrain,sft,rag (default: Config.stages)")
         if name == "ask":
             p.add_argument("question", nargs="*", help="question; omit for an interactive prompt")
             p.add_argument("--stance", help="one reply style: ok / neutral / no")

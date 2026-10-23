@@ -42,6 +42,13 @@ class Config:
     stages: str = "pretrain,sft,rag"   # env KHMER_STAGES overrides; "data" = download + tokenizer only (CPU)
     launch_ui: bool = False            # Gradio web page for customers at the end (public share link)
 
+    # ---- tokenizer ----
+    tokenizer_type: str = "unigram"    # "unigram" | "sp_bpe" (SentencePiece BPE) | "byte_bpe" (byte-level BPE, Khmer regex)
+
+    # ---- tokenizer benchmark (stage "bench") ----
+    bench_tokenizers: str = "unigram,sp_bpe,byte_bpe"   # each trained with the same model, data and steps
+    bench_steps: int = 2000
+
     # ---- model ----
     vocab_size: int = 16000            # 16000 or 32000
     context_length: int = 1024
@@ -137,16 +144,22 @@ class Config:
         return self.path("khmer_tokenizer_sample.txt.gz")
 
     @property
+    def _tok_tag(self) -> str:   # "" for unigram keeps the original file names
+        return "" if self.tokenizer_type == "unigram" else f"{self.tokenizer_type}_"
+
+    @property
     def tokenizer_prefix(self) -> str:
-        return self.path(f"khmer_sp_unigram_{self.vocab_size // 1000}k")
+        if self.tokenizer_type == "unigram":
+            return self.path(f"khmer_sp_unigram_{self.vocab_size // 1000}k")
+        return self.path(f"khmer_{self.tokenizer_type}_{self.vocab_size // 1000}k")
 
     @property
     def train_bin(self) -> str:
-        return self.path(f"train_{self.vocab_size}.bin")
+        return self.path(f"train_{self._tok_tag}{self.vocab_size}.bin")
 
     @property
     def val_bin(self) -> str:
-        return self.path(f"val_{self.vocab_size}.bin")
+        return self.path(f"val_{self._tok_tag}{self.vocab_size}.bin")
 
     @property
     def ckpt_path(self) -> str:
@@ -162,7 +175,7 @@ class Config:
 
     @property
     def sft_packed_path(self) -> str:
-        return self.path(f"sft_packed_{self.vocab_size}_{self.context_length}.npz")
+        return self.path(f"sft_packed_{self._tok_tag}{self.vocab_size}_{self.context_length}.npz")
 
     @property
     def sft_ckpt_path(self) -> str:
@@ -177,7 +190,7 @@ class Config:
         return self.path("khmer_rag_index.pt")
 
 
-ARCH_FIELDS = ("vocab_size", "context_length", "d_model", "n_layers", "n_heads", "n_kv_heads", "rope_theta",
+ARCH_FIELDS = ("tokenizer_type", "vocab_size", "context_length", "d_model", "n_layers", "n_heads", "n_kv_heads", "rope_theta",
                "norm_eps", "n_dense_layers", "n_shared_experts", "n_routed_experts", "top_k", "d_ff_shared",
                "d_ff_expert", "tie_embeddings")
 
@@ -650,7 +663,7 @@ SFT_SOURCES = [
 # ======================================================================================
 # khmer_llm/data/tokenizer.py
 # ======================================================================================
-"""SentencePiece Unigram tokenizer with byte fallback and atomic chat-marker tokens."""
+"""SentencePiece tokenizer (Unigram, or BPE with tokenizer_type="sp_bpe"), byte fallback, atomic chat markers."""
 import gzip
 import os
 import zlib
@@ -674,14 +687,15 @@ class KhmerTokenizer:
         self.model_file = cfg.tokenizer_prefix + ".model"
         if not os.path.exists(self.model_file):
             assert corpus_path is not None, "tokenizer missing and no corpus to train on"
-            print(f"\n[🔧] Training SentencePiece Unigram tokenizer ({cfg.vocab_size:,} vocab)...")
+            model_type = "bpe" if cfg.tokenizer_type == "sp_bpe" else "unigram"
+            print(f"\n[🔧] Training SentencePiece {model_type} tokenizer ({cfg.vocab_size:,} vocab)...")
             source = dict(input=corpus_path) if not corpus_path.endswith(".gz") else \
                 dict(sentence_iterator=_iter_gz_lines(corpus_path))   # SentencePiece cannot read .gz itself
             spm.SentencePieceTrainer.train(
                 **source,
                 model_prefix=cfg.tokenizer_prefix,
                 vocab_size=cfg.vocab_size,
-                model_type="unigram",
+                model_type=model_type,
                 character_coverage=0.9995,
                 byte_fallback=True,
                 split_digits=True,
@@ -734,6 +748,135 @@ class KhmerTokenizer:
     def retrieval_terms(self, ids: List[int]) -> List[int]:
         """BM25 terms: ids without control ids / chat markers / bare '▁', with '▁word' folded to 'word'."""
         return [self._canonical[i] for i in ids if i not in self._retrieval_skip]
+
+
+# ======================================================================================
+# khmer_llm/data/bpe.py
+# ======================================================================================
+"""Byte-level BPE tokenizer (HF `tokenizers`, Llama-3 / GPT-4 style) with a Khmer-aware split regex,
+plus the factory that picks a tokenizer by Config.tokenizer_type.
+
+Tokenizer types:
+  "unigram"  SentencePiece Unigram + byte fallback (default)
+  "sp_bpe"   SentencePiece BPE + byte fallback (Llama-2 / Gemma / SeaLLM style; no pre-split needed)
+  "byte_bpe" byte-level BPE over regex chunks (Llama-3 / Qwen / GPT-4 style) with KHMER_SPLIT_PATTERN
+"""
+import os
+import zlib
+from typing import Iterable, List, Optional
+
+
+
+def _cls(*ranges) -> str:
+    return "".join(chr(a) if a == b else f"{chr(a)}-{chr(b)}" for a, b in ranges)
+
+
+KHMER_ALL = _cls((0x1780, 0x17FF), (0x19E0, 0x19FF))
+KHMER_WORD = _cls((0x1780, 0x17D3), (0x17D7, 0x17D7), (0x17DC, 0x17DD), (0x19E0, 0x19FF))   # letters, vowels, signs, coeng, ៗ
+KHMER_DIGITS = _cls((0x17E0, 0x17E9), (0x17F0, 0x17F9))
+KHMER_PUNCT = _cls((0x17D4, 0x17D6), (0x17D8, 0x17DB))   # ។ ៕ ៖ ៘ ៙ ៚ ៛
+
+# Khmer split pattern. Khmer vowel signs, coeng (subscript marker) and other signs are Unicode category
+# M, not L, so GPT-4's \p{L}+ cuts every syllable apart ("ខ្ញុំ" -> "ខ", "្ញ", "ុំ"). Here a whole
+# Khmer run (consonants + vowels + signs + coeng + ៗ) is one chunk; Khmer has no spaces between
+# words, so a chunk is a phrase and BPE learns syllables/words inside it, like SentencePiece does.
+# Numerals are capped at 3 digits and punctuation stands alone; other scripts keep combining marks.
+KHMER_SPLIT_PATTERN = (
+    rf" ?[{KHMER_WORD}]+"
+    rf"| ?[{KHMER_DIGITS}]{{1,3}}"
+    rf"| ?[{KHMER_PUNCT}]"
+    r"|'(?i:[sdmt]|ll|ve|re)"
+    rf"|[^\r\n\p{{L}}\p{{N}}\p{{M}}]?(?:(?![{KHMER_ALL}])[\p{{L}}\p{{M}}])+"
+    r"|\p{N}{1,3}"
+    rf"| ?(?:(?![{KHMER_ALL}])[^\s\p{{L}}\p{{N}}\p{{M}}])+[\r\n]*"
+    r"|\s*[\r\n]"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+# GPT-4 (cl100k) pattern, for comparison only: it breaks Khmer clusters (see above).
+GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+
+SPECIALS = ["<s>", "</s>", "<pad>"] + CHAT_SYMBOLS   # ids at the top of the vocab, never produced by encode()
+
+
+def _pre_tokenizer(pattern: str):
+    from tokenizers import Regex, pre_tokenizers
+    return pre_tokenizers.Sequence([pre_tokenizers.Split(Regex(pattern), behavior="isolated"),
+                                    pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+
+
+def train_byte_bpe(lines: Iterable[str], path: str, vocab_size: int, pattern: str = KHMER_SPLIT_PATTERN) -> int:
+    """Trains byte-level BPE with vocab_size - len(SPECIALS) entries and saves tokenizer.json at `path`."""
+    ensure_package("tokenizers")
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    tk = Tokenizer(models.BPE())
+    tk.pre_tokenizer = _pre_tokenizer(pattern)
+    tk.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(vocab_size=vocab_size - len(SPECIALS), min_frequency=2, show_progress=False,
+                                  initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), special_tokens=[])
+    tk.train_from_iterator(lines, trainer=trainer)
+    tk.save(path + ".tmp")
+    os.replace(path + ".tmp", path)
+    return tk.get_vocab_size()
+
+
+class KhmerByteBPETokenizer:
+    """Byte-level BPE with the same interface as KhmerTokenizer. Specials (EOS, pad, chat markers) are
+    managed here at the top ids, so text that contains "</s>" or "<|user|>" can never produce them."""
+
+    def __init__(self, cfg: Config, corpus_path: Optional[str] = None):
+        ensure_package("tokenizers")
+        from tokenizers import Tokenizer
+        self.model_file = cfg.tokenizer_prefix + ".json"
+        self.vocab_size = cfg.vocab_size
+        if not os.path.exists(self.model_file):
+            assert corpus_path is not None, "byte-BPE tokenizer missing and no corpus to train on"
+            print(f"\n[🔧] Training byte-level BPE tokenizer ({cfg.vocab_size:,} vocab, Khmer regex)...")
+            lines = _iter_gz_lines(corpus_path) if corpus_path.endswith(".gz") else \
+                (l.rstrip("\n") for l in open(corpus_path, encoding="utf-8") if l.strip())
+            n = train_byte_bpe(lines, self.model_file, cfg.vocab_size)
+            print(f"[✓] Saved {self.model_file} ({n:,} learned tokens + {len(SPECIALS)} specials)")
+        self.hf = Tokenizer.from_file(self.model_file)
+        n_learned = self.hf.get_vocab_size()
+        first_special = self.vocab_size - len(SPECIALS)
+        assert n_learned <= first_special, f"tokenizer has {n_learned} tokens; vocab_size {self.vocab_size} too small"
+        self.special_ids = {s: first_special + i for i, s in enumerate(SPECIALS)}
+        self.bos_id, self.eos_id, self.pad_id = (self.special_ids[s] for s in ("<s>", "</s>", "<pad>"))
+        self.unk_id = None
+        self.marker_ids = {s: self.special_ids[s] for s in CHAT_SYMBOLS}
+        with open(self.model_file, "rb") as f:
+            self.fingerprint = f"{zlib.crc32(f.read()):08x}"
+        vocab = self.hf.get_vocab()                         # byte-level strings; "Ġ" = leading space
+        self._canonical = {i: vocab[t[1:]] for t, i in vocab.items() if t.startswith("Ġ") and t[1:] in vocab}
+        self._retrieval_skip = set(self.special_ids.values()) | {vocab.get("Ġ", -1)}
+
+    def encode(self, text: str) -> List[int]:
+        return self.hf.encode(text, add_special_tokens=False).ids
+
+    def encode_batch(self, texts: List[str]) -> List[List[int]]:
+        return [e.ids for e in self.hf.encode_batch(texts, add_special_tokens=False)]
+
+    def decode(self, ids: List[int]) -> str:
+        return self.hf.decode([i for i in ids if i < self.hf.get_vocab_size()], skip_special_tokens=False)
+
+    def marker(self, symbol: str) -> List[int]:
+        return [self.marker_ids[symbol]]
+
+    def retrieval_terms(self, ids: List[int]) -> List[int]:
+        """BM25 terms: no specials / bare space, and " word" folded to "word"."""
+        return [self._canonical.get(i, i) for i in ids if i not in self._retrieval_skip]
+
+
+TOKENIZER_TYPES = ("unigram", "sp_bpe", "byte_bpe")
+
+
+def load_tokenizer(cfg: Config, corpus_path: Optional[str] = None):
+    """Loads (or trains from corpus_path) the tokenizer selected by cfg.tokenizer_type."""
+    if cfg.tokenizer_type in ("unigram", "sp_bpe"):
+        return KhmerTokenizer(cfg, corpus_path)
+    if cfg.tokenizer_type == "byte_bpe":
+        return KhmerByteBPETokenizer(cfg, corpus_path)
+    raise ValueError(f"unknown tokenizer_type {cfg.tokenizer_type!r}; use one of {TOKENIZER_TYPES}")
 
 
 # ======================================================================================
@@ -866,7 +1009,9 @@ def token_bins_ready(cfg: Config, tok: KhmerTokenizer) -> bool:
     return meta.get("tokenizer") in (None, tok.fingerprint)   # None: bins from before fingerprints existed
 
 
-def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
+def prepare_token_bins(cfg: Config, tok: KhmerTokenizer, source: Optional[str] = None):
+    """Tokenizes `source` (default: the corpus) into train/val uint16 bins; val = hash-selected lines.
+    The meta records UTF-8 bytes per split (+1 per line for EOS) so bits-per-byte can be computed."""
     meta_path = cfg.train_bin + ".json"
     if token_bins_ready(cfg, tok):
         print(f"[✓] Token bins found: {json.load(open(meta_path))}")
@@ -875,15 +1020,21 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
         print("[!] Token bins were built with a different tokenizer; rebuilding.")
     assert tok.vocab_size < 2**16, "uint16 bins need vocab < 65536"
     print("\n[🔄] Tokenizing corpus -> uint16 memmap bins...")
-    n_train = n_val = 0
+    n_train = n_val = train_bytes = val_bytes = 0
     with open(cfg.train_bin + ".tmp", "wb") as ft, open(cfg.val_bin + ".tmp", "wb") as fv:
 
         def flush(lines: List[str]):
-            nonlocal n_train, n_val
+            nonlocal n_train, n_val, train_bytes, val_bytes
             tr, va = [], []
             for line, ids in zip(lines, tok.encode_batch(lines)):
                 if ids:
-                    (va if zlib.crc32(line.encode("utf-8")) % cfg.val_every_n_lines == 0 else tr).append(ids)
+                    raw = line.encode("utf-8")
+                    if zlib.crc32(raw) % cfg.val_every_n_lines == 0:
+                        va.append(ids)
+                        val_bytes += len(raw) + 1
+                    else:
+                        tr.append(ids)
+                        train_bytes += len(raw) + 1
             tr_arr, va_arr = _flatten_with_eos(tr, tok.eos_id), _flatten_with_eos(va, tok.eos_id)   # EOS ends a doc
             tr_arr.tofile(ft)
             va_arr.tofile(fv)
@@ -891,7 +1042,7 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
             n_val += len(va_arr)
 
         batch = []
-        for line in tqdm(iter_lines(cfg.corpus_path), desc="Tokenizing", unit=" lines", mininterval=10):
+        for line in tqdm(iter_lines(source or cfg.corpus_path), desc="Tokenizing", unit=" lines", mininterval=10):
             batch.append(line)
             if len(batch) >= 100_000:
                 flush(batch)
@@ -901,7 +1052,8 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
 
     os.replace(cfg.train_bin + ".tmp", cfg.train_bin)
     os.replace(cfg.val_bin + ".tmp", cfg.val_bin)
-    meta = dict(train_tokens=n_train, val_tokens=n_val, vocab_size=tok.vocab_size, tokenizer=tok.fingerprint)
+    meta = dict(train_tokens=n_train, val_tokens=n_val, vocab_size=tok.vocab_size, tokenizer=tok.fingerprint,
+                train_bytes=train_bytes, val_bytes=val_bytes, source=os.path.basename(source or cfg.corpus_path))
     with open(meta_path + ".tmp", "w") as f:
         json.dump(meta, f)
     os.replace(meta_path + ".tmp", meta_path)
@@ -2345,7 +2497,7 @@ class KhmerRAG:
         rt = setup_runtime(allow_ddp=False)
         model = load_chat_model(cfg, rt)
         cfg = with_architecture_of(cfg, asdict(model.cfg))
-        return cls.build(cfg, rt, model, KhmerTokenizer(cfg), prefer_existing_index=True)
+        return cls.build(cfg, rt, model, load_tokenizer(cfg), prefer_existing_index=True)
 
     def retrieve(self, question: str, top_k: Optional[int] = None) -> List[int]:
         question = clean_multiline(question)
@@ -2688,6 +2840,166 @@ def self_test(rt: Runtime):
 
 
 # ======================================================================================
+# khmer_llm/bench.py
+# ======================================================================================
+"""Tokenizer benchmark: the same model, data and number of steps with each tokenizer, ranked by
+bits per byte (BPB) on held-out text. Loss per token is NOT comparable across tokenizers (a tokenizer
+with longer tokens has fewer, harder tokens), BPB is: total NLL / ln 2 / UTF-8 bytes of the text.
+"""
+import json
+import math
+import os
+import time
+import zlib
+from dataclasses import replace
+from typing import Dict, List
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+BENCH_PROMPT = "ប្រទេសកម្ពុជាគឺជា"
+
+
+def tokenizer_stats(tok, lines: List[str]) -> Dict[str, float]:
+    """Compression and Khmer-cluster integrity of a tokenizer on held-out lines."""
+    pieces: Dict[int, str] = {}
+    n_tok = n_chars = n_bytes = broken = partial = 0
+    used = set()
+    for line in lines:
+        ids = tok.encode(line)
+        n_tok += len(ids)
+        n_chars += len(line)
+        n_bytes += len(line.encode("utf-8"))
+        used.update(ids)
+        for i in ids:
+            if i not in pieces:
+                pieces[i] = tok.decode([i])
+            piece = pieces[i]
+            core = piece.strip()
+            if "�" in piece or not piece:
+                partial += 1        # a raw byte piece: not even a whole character
+            elif core and (KHMER_SIGN_RE.match(core) or core.endswith(COENG)):
+                broken += 1         # starts with a vowel sign / ends with coeng: a Khmer cluster was split
+    n = max(1, n_tok)
+    return dict(chars_per_token=n_chars / n, bytes_per_token=n_bytes / n, tokens_used=len(used),
+                byte_piece_rate=partial / n, broken_cluster_rate=broken / n)
+
+
+@torch.no_grad()
+def evaluate_bpb(model, val_path: str, val_bytes: int, cfg: Config, rt: Runtime, batch_size: int = 8) -> Dict[str, float]:
+    """Exact NLL over every token of the val bin (non-overlapping windows) -> bits per byte."""
+    data = torch.from_numpy(np.memmap(val_path, dtype=np.uint16, mode="r").astype(np.int64))
+    T, n = cfg.context_length, len(data)
+    full = (n - 1) // T
+    total_nll, total_tok = 0.0, 0
+    model.eval()
+    windows = [(s * T, T) for s in range(full)]
+    if (n - 1) % T:
+        windows.append((full * T, (n - 1) % T))
+    for i in range(0, len(windows), batch_size):
+        group = windows[i:i + batch_size]
+        for length in sorted({w[1] for w in group}):   # the last window may be shorter
+            starts = [s for s, l in group if l == length]
+            x = torch.stack([data[s:s + length] for s in starts]).to(rt.device)
+            y = torch.stack([data[s + 1:s + 1 + length] for s in starts]).to(rt.device)
+            with autocast_ctx(rt):
+                logits = model(x)[0]
+            total_nll += F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y.reshape(-1),
+                                         reduction="sum").item()
+            total_tok += y.numel()
+    model.train()
+    return dict(val_loss_per_token=total_nll / max(1, total_tok), bpb=total_nll / math.log(2) / max(1, val_bytes),
+                val_tokens=total_tok)
+
+
+def _held_out_lines(cfg: Config, source: str, limit: int = 3000) -> List[str]:
+    out = []
+    for line in iter_lines(source):
+        if zlib.crc32(line.encode("utf-8")) % cfg.val_every_n_lines == 0:   # same split as the val bins
+            out.append(line)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def run_tokenizer_benchmark(cfg: Config, rt: Runtime) -> dict:
+    kinds = [k.strip() for k in cfg.bench_tokenizers.split(",") if k.strip()]
+    source = first_existing([cfg.tokenizer_sample_path, cfg.corpus_path])
+    if source is None:
+        if rt.master:
+            harvest_khmer_corpus(cfg)
+        barrier(rt)
+        source = first_existing([cfg.tokenizer_sample_path, cfg.corpus_path])
+    held_out = _held_out_lines(cfg, source) if rt.master else []
+    if rt.master:
+        print("\n" + "=" * 78)
+        print(f"📏 TOKENIZER BENCHMARK: {', '.join(kinds)} | {cfg.bench_steps} steps each | text: {os.path.basename(source)}")
+        print("=" * 78)
+
+    results = {}
+    for kind in kinds:
+        shared = replace(cfg, tokenizer_type=kind)   # tokenizer lives in work_dir (shared with the main pipeline)
+        vcfg = replace(shared, work_dir=os.path.join(cfg.work_dir, f"bench_{kind}"), import_dir=None,
+                       max_iters=cfg.bench_steps, warmup_iters=min(cfg.warmup_iters, max(1, cfg.bench_steps // 10)),
+                       eval_interval=max(1, cfg.bench_steps // 4), ckpt_interval=max(1, cfg.bench_steps // 2))
+        if rt.master:
+            os.makedirs(vcfg.work_dir, exist_ok=True)
+            t0 = time.time()
+            tok = load_tokenizer(shared, source)   # trains on `source` if missing
+            tok_seconds = time.time() - t0
+            prepare_token_bins(vcfg, tok, source=source)
+        barrier(rt)
+        tok = load_tokenizer(shared)
+
+        T, B = vcfg.context_length, vcfg.batch_size
+        train_loader = TokenLoader(vcfg.train_bin, B, T, rt.device, vcfg.seed + rt.rank)
+        val_loader = TokenLoader(vcfg.val_bin, B, T, rt.device, vcfg.seed + 20_000)
+        raw_model = build_model(vcfg, rt)
+        model = wrap_model(raw_model, vcfg, rt)
+        sample_fn = lambda: generate(raw_model, tok, BENCH_PROMPT, rt, max_new_tokens=40)
+        t0 = time.time()
+        step = run_training(vcfg, rt, model, raw_model, train_loader, {"val": val_loader}, vcfg.ckpt_path,
+                            sample_fn, f"BENCH [{kind}]")
+        train_seconds = time.time() - t0
+
+        if rt.master:
+            with open(vcfg.train_bin + ".json") as f:
+                meta = json.load(f)
+            stats = tokenizer_stats(tok, held_out)
+            ev = evaluate_bpb(raw_model, vcfg.val_bin, meta["val_bytes"], vcfg, rt)
+            tokens_seen = step * B * T * vcfg.grad_accum_steps * rt.world_size
+            results[kind] = dict(**stats, **ev, steps=step, tokens_seen=tokens_seen,
+                                 chars_seen=tokens_seen * stats["chars_per_token"], train_minutes=train_seconds / 60,
+                                 tokenizer_minutes=tok_seconds / 60, corpus_tokens=meta["train_tokens"],
+                                 sample=generate(raw_model, tok, BENCH_PROMPT, rt, max_new_tokens=40, temperature=0.7))
+            print(f"[✓] {kind}: BPB {ev['bpb']:.4f} | {stats['chars_per_token']:.2f} chars/token")
+        del model, raw_model
+        free_memory()
+        barrier(rt)
+
+    if rt.master and results:
+        print("\n" + "=" * 78)
+        print("📏 RESULTS (same model, data and steps; lower BPB = better)")
+        print("=" * 78)
+        print(f"{'tokenizer':<10} {'val BPB':>8} {'chars/tok':>9} {'broken':>7} {'byte pcs':>8} "
+              f"{'loss/tok':>8} {'text seen':>10} {'train':>7}")
+        for kind, r in sorted(results.items(), key=lambda kv: kv[1]["bpb"]):
+            print(f"{kind:<10} {r['bpb']:>8.4f} {r['chars_per_token']:>9.2f} {r['broken_cluster_rate']:>6.1%} "
+                  f"{r['byte_piece_rate']:>7.1%} {r['val_loss_per_token']:>8.3f} {r['chars_seen'] / 1e6:>8.0f}Mc "
+                  f"{r['train_minutes']:>5.0f}m")
+        best = min(results, key=lambda k: results[k]["bpb"])
+        print(f"\n🏆 Best: {best}  (use it with Config(tokenizer_type='{best}'))")
+        for kind, r in results.items():
+            print(f"   [{kind}] {r['sample'][:150]}")
+        with open(cfg.path("bench_results.json"), "w") as f:
+            json.dump(results, f, ensure_ascii=False, indent=1)
+        print(f"Saved {cfg.path('bench_results.json')}")
+    return results
+
+
+# ======================================================================================
 # khmer_llm/pipeline.py
 # ======================================================================================
 """Runs the stages in order: tokenizer -> pretrain -> SFT -> RAG (and optionally the web UI)."""
@@ -2699,23 +3011,23 @@ import torch
 import torch.distributed as dist
 
 
-STAGES = ("data", "pretrain", "sft", "rag")
+STAGES = ("data", "bench", "pretrain", "sft", "rag")
 
 
 def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
     """Loads the tokenizer, harvesting the corpus and training it first if it is missing."""
     if rt.master and not os.path.exists(cfg.tokenizer_prefix + ".model"):
         harvest_khmer_corpus(cfg)
-        KhmerTokenizer(cfg, cfg.tokenizer_sample_path)
+        load_tokenizer(cfg, cfg.tokenizer_sample_path)
     barrier(rt)
-    tok = KhmerTokenizer(cfg)
+    tok = load_tokenizer(cfg)
     assert tok.vocab_size == cfg.vocab_size, f"tokenizer vocab {tok.vocab_size} != config {cfg.vocab_size}"
     return tok
 
 
 def check_prerequisites(cfg: Config, stage_list):
     """Fail fast (before hours of downloading) when a later stage is run without earlier outputs."""
-    if "pretrain" in stage_list or "data" in stage_list:
+    if "pretrain" in stage_list or "data" in stage_list or "bench" in stage_list:
         return
     hint = "include the 'pretrain' stage, or point work_dir / import_dir at a previous run's outputs"
     if not os.path.exists(cfg.tokenizer_prefix + ".model"):
@@ -2776,6 +3088,9 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     results = dict(config=cfg, tokenizer=tok)
     if "data" in stage_list:
         run_data(cfg, rt, tok)
+    if "bench" in stage_list:
+        pass
+        results["bench"] = run_tokenizer_benchmark(cfg, rt)
     if "pretrain" in stage_list:
         run_pretrain(cfg, rt, tok)
     if "sft" in stage_list:

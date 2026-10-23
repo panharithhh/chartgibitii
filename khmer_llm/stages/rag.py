@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from ..chat import STANCES, build_chat_example, chat, system_text
 from ..config import Config, with_architecture_of
 from ..data.corpus import open_text
+from ..data.bpe import load_tokenizer
 from ..data.tokenizer import KhmerTokenizer
 from ..model.lm import KimiMoELM, build_model
 from ..runtime import Runtime, ensure_package, link_previous_outputs, setup_runtime
@@ -269,7 +270,7 @@ class KhmerRAG:
         rt = setup_runtime(allow_ddp=False)
         model = load_chat_model(cfg, rt)
         cfg = with_architecture_of(cfg, asdict(model.cfg))
-        return cls.build(cfg, rt, model, KhmerTokenizer(cfg), prefer_existing_index=True)
+        return cls.build(cfg, rt, model, load_tokenizer(cfg), prefer_existing_index=True)
 
     def retrieve(self, question: str, top_k: Optional[int] = None) -> List[int]:
         question = clean_multiline(question)

@@ -8,6 +8,7 @@ import torch.distributed as dist
 
 from .config import Config, apply_overrides
 from .data.corpus import harvest_khmer_corpus, prepare_token_bins, token_bins_ready
+from .data.bpe import load_tokenizer
 from .data.tokenizer import KhmerTokenizer
 from .runtime import RUNTIME_FLAGS, Runtime, barrier, link_previous_outputs, setup_runtime
 from .selftest import self_test
@@ -16,23 +17,23 @@ from .stages.rag import rag_fallback_path, run_rag
 from .stages.sft import harvest_sft_examples, prepare_sft_data, run_sft
 from .train.checkpoint import first_existing
 
-STAGES = ("data", "pretrain", "sft", "rag")
+STAGES = ("data", "bench", "pretrain", "sft", "rag")
 
 
 def prepare_tokenizer(cfg: Config, rt: Runtime) -> KhmerTokenizer:
     """Loads the tokenizer, harvesting the corpus and training it first if it is missing."""
     if rt.master and not os.path.exists(cfg.tokenizer_prefix + ".model"):
         harvest_khmer_corpus(cfg)
-        KhmerTokenizer(cfg, cfg.tokenizer_sample_path)
+        load_tokenizer(cfg, cfg.tokenizer_sample_path)
     barrier(rt)
-    tok = KhmerTokenizer(cfg)
+    tok = load_tokenizer(cfg)
     assert tok.vocab_size == cfg.vocab_size, f"tokenizer vocab {tok.vocab_size} != config {cfg.vocab_size}"
     return tok
 
 
 def check_prerequisites(cfg: Config, stage_list):
     """Fail fast (before hours of downloading) when a later stage is run without earlier outputs."""
-    if "pretrain" in stage_list or "data" in stage_list:
+    if "pretrain" in stage_list or "data" in stage_list or "bench" in stage_list:
         return
     hint = "include the 'pretrain' stage, or point work_dir / import_dir at a previous run's outputs"
     if not os.path.exists(cfg.tokenizer_prefix + ".model"):
@@ -93,6 +94,9 @@ def main(cfg: Optional[Config] = None, stages: Optional[str] = None) -> dict:
     results = dict(config=cfg, tokenizer=tok)
     if "data" in stage_list:
         run_data(cfg, rt, tok)
+    if "bench" in stage_list:
+        from .bench import run_tokenizer_benchmark
+        results["bench"] = run_tokenizer_benchmark(cfg, rt)
     if "pretrain" in stage_list:
         run_pretrain(cfg, rt, tok)
     if "sft" in stage_list:

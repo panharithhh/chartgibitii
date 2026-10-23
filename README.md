@@ -85,6 +85,26 @@ python -m khmer_llm run --set max_iters=100 --set vocab_size=32000   # override 
 ```
 To use 2 GPUs: `torchrun --nproc_per_node=2 -m khmer_llm run`.
 
+## Tokenizer benchmark (pick the best tokenizer)
+Trains the **same model** for `bench_steps` (default 2000) with each tokenizer on the same text, then ranks
+them by **bits per byte** on held-out text. Loss per token can't be compared across tokenizers; BPB can.
+
+| `tokenizer_type` | What | Used by |
+|---|---|---|
+| `unigram` (default) | SentencePiece Unigram + byte fallback | T5, XLNet |
+| `sp_bpe` | SentencePiece BPE + byte fallback, works on raw unsegmented text | Llama 2, Gemma, SeaLLM |
+| `byte_bpe` | byte-level BPE (HF `tokenizers`) + **Khmer-aware split regex** | Llama 3 / Qwen / GPT-4 style |
+
+GPT-4's split regex uses `\p{L}+`, which leaves out Khmer vowel signs and the coeng subscript marker, so it
+cuts every syllable (`ខ្ញុំ` → `ខ` `្ញ` `ុំ`). `KHMER_SPLIT_PATTERN` (in `khmer_llm/data/bpe.py`) keeps
+each Khmer run whole, caps numerals at 3 digits and gives `។ ៕ ៖ ៛` their own chunks.
+
+Kaggle, one GPU notebook (downloads a smaller corpus itself):
+```python
+!KHMER_SET="stages=bench;max_corpus_chars=600000000;max_harvest_hours=1.5" torchrun --nproc_per_node=2 train.py
+```
+Output: a results table, `bench_results.json`, and `🏆 Best: <type>`. Then train for real with `tokenizer_type=<best>`.
+
 ## Use your own data
 
 | What | How |

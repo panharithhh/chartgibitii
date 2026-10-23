@@ -130,7 +130,9 @@ def token_bins_ready(cfg: Config, tok: KhmerTokenizer) -> bool:
     return meta.get("tokenizer") in (None, tok.fingerprint)   # None: bins from before fingerprints existed
 
 
-def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
+def prepare_token_bins(cfg: Config, tok: KhmerTokenizer, source: Optional[str] = None):
+    """Tokenizes `source` (default: the corpus) into train/val uint16 bins; val = hash-selected lines.
+    The meta records UTF-8 bytes per split (+1 per line for EOS) so bits-per-byte can be computed."""
     meta_path = cfg.train_bin + ".json"
     if token_bins_ready(cfg, tok):
         print(f"[✓] Token bins found: {json.load(open(meta_path))}")
@@ -139,15 +141,21 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
         print("[!] Token bins were built with a different tokenizer; rebuilding.")
     assert tok.vocab_size < 2**16, "uint16 bins need vocab < 65536"
     print("\n[🔄] Tokenizing corpus -> uint16 memmap bins...")
-    n_train = n_val = 0
+    n_train = n_val = train_bytes = val_bytes = 0
     with open(cfg.train_bin + ".tmp", "wb") as ft, open(cfg.val_bin + ".tmp", "wb") as fv:
 
         def flush(lines: List[str]):
-            nonlocal n_train, n_val
+            nonlocal n_train, n_val, train_bytes, val_bytes
             tr, va = [], []
             for line, ids in zip(lines, tok.encode_batch(lines)):
                 if ids:
-                    (va if zlib.crc32(line.encode("utf-8")) % cfg.val_every_n_lines == 0 else tr).append(ids)
+                    raw = line.encode("utf-8")
+                    if zlib.crc32(raw) % cfg.val_every_n_lines == 0:
+                        va.append(ids)
+                        val_bytes += len(raw) + 1
+                    else:
+                        tr.append(ids)
+                        train_bytes += len(raw) + 1
             tr_arr, va_arr = _flatten_with_eos(tr, tok.eos_id), _flatten_with_eos(va, tok.eos_id)   # EOS ends a doc
             tr_arr.tofile(ft)
             va_arr.tofile(fv)
@@ -155,7 +163,7 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
             n_val += len(va_arr)
 
         batch = []
-        for line in tqdm(iter_lines(cfg.corpus_path), desc="Tokenizing", unit=" lines", mininterval=10):
+        for line in tqdm(iter_lines(source or cfg.corpus_path), desc="Tokenizing", unit=" lines", mininterval=10):
             batch.append(line)
             if len(batch) >= 100_000:
                 flush(batch)
@@ -165,7 +173,8 @@ def prepare_token_bins(cfg: Config, tok: KhmerTokenizer):
 
     os.replace(cfg.train_bin + ".tmp", cfg.train_bin)
     os.replace(cfg.val_bin + ".tmp", cfg.val_bin)
-    meta = dict(train_tokens=n_train, val_tokens=n_val, vocab_size=tok.vocab_size, tokenizer=tok.fingerprint)
+    meta = dict(train_tokens=n_train, val_tokens=n_val, vocab_size=tok.vocab_size, tokenizer=tok.fingerprint,
+                train_bytes=train_bytes, val_bytes=val_bytes, source=os.path.basename(source or cfg.corpus_path))
     with open(meta_path + ".tmp", "w") as f:
         json.dump(meta, f)
     os.replace(meta_path + ".tmp", meta_path)
